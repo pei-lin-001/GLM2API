@@ -142,6 +142,14 @@ bash scripts/deploy-zai-linux.sh stop
 ZAI_VERIFY_BASE_URL=http://127.0.0.1:8788 pnpm run zai:verify-stream
 ```
 
+> 重要：如果你更新了仓库代码，必须执行一次：
+>
+> ```bash
+> bash scripts/deploy-zai-linux.sh restart
+> ```
+>
+> 否则后台仍然会继续跑旧代码。
+
 ---
 
 ## 接口验证
@@ -151,6 +159,13 @@ ZAI_VERIFY_BASE_URL=http://127.0.0.1:8788 pnpm run zai:verify-stream
 ```bash
 curl http://127.0.0.1:8788/health
 ```
+
+返回中会包含：
+
+- `buildVersion`：当前正在运行的代码版本
+- `feVersion`：当前上游前端版本
+
+如果你只是 `git pull` 了代码，但没有重启后台进程，那么 `/health` 里的 `buildVersion` 不会变化。
 
 ### 2）拉取模型列表
 

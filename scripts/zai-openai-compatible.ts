@@ -1,5 +1,6 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { execSync } from 'node:child_process';
 import { URL } from 'node:url';
 
 type JsonRecord = Record<string, unknown>;
@@ -156,6 +157,23 @@ const MIRROR_REASONING_TO_CONTENT = parseBoolean(
   process.env.ZAI_MIRROR_REASONING_TO_CONTENT,
   true
 );
+
+function resolveBuildVersion(): string {
+  const envValue = process.env.ZAI_BUILD_VERSION?.trim();
+  if (envValue) return envValue;
+
+  try {
+    return execSync('git rev-parse --short HEAD', {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString('utf8')
+      .trim();
+  } catch {
+    return 'unknown';
+  }
+}
+
+const BUILD_VERSION = resolveBuildVersion();
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (value == null || value === '') return fallback;
@@ -1770,6 +1788,7 @@ const server = createServer(async (req, res) => {
       writeJson(res, 200, {
         status: 'ok',
         service: 'zai-openai-compatible',
+        buildVersion: BUILD_VERSION,
         upstream: STARTUP_URL,
         feVersion,
       });
@@ -2021,5 +2040,6 @@ process.on('SIGTERM', () => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[zai-openai-compatible] listening on http://${HOST}:${PORT}`);
+  console.log(`[zai-openai-compatible] buildVersion=${BUILD_VERSION}`);
   console.log('[zai-openai-compatible] endpoints: GET /health, GET /v1/models, POST /v1/chat/completions');
 });

@@ -31,6 +31,7 @@ BIND_HOST="${DEFAULT_HOST}"
 BIND_PORT="${DEFAULT_PORT}"
 HEALTH_HOST="127.0.0.1"
 HEALTH_URL=""
+BUILD_VERSION=""
 
 log() {
   printf '[deploy-zai-linux] %s\n' "$*"
@@ -121,6 +122,14 @@ read_package_manager() {
   if [[ -z "${PNPM_PACKAGE}" ]]; then
     fail '无法从 package.json 读取 packageManager'
   fi
+}
+
+resolve_build_version() {
+  if command -v git >/dev/null 2>&1 && git -C "${ROOT_DIR}" rev-parse --short HEAD >/dev/null 2>&1; then
+    BUILD_VERSION="$(git -C "${ROOT_DIR}" rev-parse --short HEAD)"
+    return
+  fi
+  BUILD_VERSION="unknown"
 }
 
 ensure_dirs() {
@@ -294,6 +303,7 @@ cd "${ROOT_DIR}"
 set -a
 source "${ENV_FILE}"
 set +a
+export ZAI_BUILD_VERSION="${BUILD_VERSION}"
 exec "${NODE_BIN}" "${PNPM_CLI}" exec tsx scripts/zai-openai-compatible.ts
 LAUNCHEOF
   chmod +x "${LAUNCH_FILE}"
@@ -414,6 +424,7 @@ deploy_service() {
   ensure_dirs
   ensure_env_file
   load_env_file
+  resolve_build_version
   read_package_manager
   ensure_node_and_npm
   ensure_pnpm
@@ -432,6 +443,7 @@ main() {
       ensure_dirs
       ensure_env_file
       load_env_file
+      resolve_build_version
       read_package_manager
       ensure_node_and_npm
       ensure_pnpm
@@ -443,6 +455,7 @@ main() {
       ensure_dirs
       ensure_env_file
       load_env_file
+      resolve_build_version
       read_package_manager
       ensure_node_and_npm
       ensure_pnpm
@@ -459,6 +472,7 @@ main() {
       ensure_dirs
       ensure_env_file
       load_env_file
+      resolve_build_version
       read_package_manager
       ensure_node_and_npm
       ensure_pnpm
