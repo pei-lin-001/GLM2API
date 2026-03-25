@@ -1,0 +1,20 @@
+{
+  "name": "glm2api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.28.2",
+  "description": "OpenAI Compatible HTTP bridge for chat.z.ai with Linux one-command deployment",
+  "scripts": {
+    "zai:openai": "tsx scripts/zai-openai-compatible.ts",
+    "zai:stress": "tsx scripts/zai-stress-test.ts"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}

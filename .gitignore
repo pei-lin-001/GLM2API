@@ -1,0 +1,4 @@
+node_modules
+.zai-linux
+.env
+.DS_Store
