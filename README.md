@@ -42,7 +42,23 @@
 
 - `/v1/models` 会动态拉取上游真实模型列表
 - `/v1/chat/completions` 会把请求转发到 Z.ai 上游，再转换成 OpenAI 风格响应
+- 当上游开启 thinking 时，代理会把 `phase=thinking` 转成 `reasoning_content`
 - `tools` / `tool_choice` / `parallel_tool_calls` 已做兼容适配
+
+### 1.1 reasoning / 思维链流式输出
+
+当请求体中使用：
+
+```json
+{ "stream": true }
+```
+
+并且上游返回 thinking 阶段时，代理会实时输出：
+
+- `choices[0].delta.reasoning_content`：思维链增量
+- `choices[0].delta.content`：最终答案增量
+
+也就是说，客户端会先收到 reasoning，再收到最终 answer，而不是等上游完整结束后一次性下发。
 
 ### 2. 纯 HTTP，无需浏览器常驻
 
@@ -148,6 +164,26 @@ curl http://127.0.0.1:8788/v1/chat/completions \
   }'
 ```
 
+### 3.1）验证 reasoning_content 流式输出
+
+```bash
+curl -N http://127.0.0.1:8788/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "glm-5",
+    "stream": true,
+    "messages": [
+      { "role": "user", "content": "请先简短思考，再只回答 1+1 的结果。" }
+    ]
+  }'
+```
+
+预期现象：
+
+1. 先出现 `reasoning_content`
+2. 后出现 `content`
+3. 最后出现 `finish_reason=stop` 和 `[DONE]`
+
 ### 4）工具调用（首轮）
 
 ```bash
@@ -200,6 +236,7 @@ pnpm run zai:stress
 
 - `models`：多轮拉模型
 - `basic`：多轮普通聊天
+- `stream_reasoning`：验证 `reasoning_content` 是否真实流式到达
 - `tool_cycle`：多轮工具调用往返
 - `basic_burst`：并发 basic 请求
 

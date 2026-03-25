@@ -100,11 +100,21 @@ type ZaiModelDescriptor = {
 };
 
 type ZaiParsedStream = {
+  reasoningDeltas: string[];
+  reasoningText: string;
   answerDeltas: string[];
   assistantText: string;
   usage?: JsonRecord;
   upstreamModel: string | null;
   created: number | null;
+};
+
+type ZaiStreamEvent = {
+  phase: string;
+  deltaContent: string;
+  content: string;
+  usage?: JsonRecord;
+  done: boolean;
 };
 
 const HOST = process.env.ZAI_OPENAI_HOST?.trim() || '127.0.0.1';
@@ -236,6 +246,128 @@ function writeJson(res: ServerResponse, statusCode: number, payload: unknown): v
 
 function writeSseLine(res: ServerResponse, payload: unknown): void {
   res.write(`data: ${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n\n`);
+}
+
+function createEmptyParsedStream(): ZaiParsedStream {
+  return {
+    reasoningDeltas: [],
+    reasoningText: '',
+    answerDeltas: [],
+    assistantText: '',
+    usage: undefined,
+    upstreamModel: null,
+    created: null,
+  };
+}
+
+function finalizeParsedStream(parsed: ZaiParsedStream): ZaiParsedStream {
+  const reasoningText =
+    parsed.reasoningDeltas.length > 0 ? parsed.reasoningDeltas.join('') : parsed.reasoningText;
+  const assistantText =
+    parsed.answerDeltas.length > 0 ? parsed.answerDeltas.join('') : parsed.assistantText;
+
+  return {
+    ...parsed,
+    reasoningDeltas: parsed.reasoningDeltas.length > 0 ? parsed.reasoningDeltas : reasoningText ? [reasoningText] : [],
+    reasoningText,
+    answerDeltas: parsed.answerDeltas.length > 0 ? parsed.answerDeltas : assistantText ? [assistantText] : [],
+    assistantText,
+  };
+}
+
+function drainSseBlocks(buffer: string): { blocks: string[]; rest: string } {
+  let normalized = buffer.replace(/\r\n/g, '\n');
+  const blocks: string[] = [];
+
+  while (true) {
+    const separatorIndex = normalized.indexOf('\n\n');
+    if (separatorIndex === -1) break;
+    blocks.push(normalized.slice(0, separatorIndex));
+    normalized = normalized.slice(separatorIndex + 2);
+  }
+
+  return {
+    blocks,
+    rest: normalized,
+  };
+}
+
+function applyZaiSsePayload(target: ZaiParsedStream, payload: string): ZaiStreamEvent | null {
+  if (!payload || payload === '[DONE]') {
+    return {
+      phase: 'done',
+      deltaContent: '',
+      content: '',
+      done: true,
+    };
+  }
+
+  const parsed = JSON.parse(payload) as JsonRecord;
+  if (typeof parsed.model === 'string' && !target.upstreamModel) target.upstreamModel = parsed.model;
+  if (typeof parsed.created === 'number' && !target.created) target.created = parsed.created;
+
+  if (parsed.data === '[DONE]') {
+    return {
+      phase: 'done',
+      deltaContent: '',
+      content: '',
+      done: true,
+    };
+  }
+
+  if (!parsed.data || typeof parsed.data !== 'object') return null;
+
+  const data = parsed.data as JsonRecord;
+  const error = data.error;
+  if (error && typeof error === 'object') {
+    const errorRecord = error as JsonRecord;
+    throw new Error(String(errorRecord.detail || errorRecord.message || 'Unknown upstream error'));
+  }
+
+  const usage = data.usage && typeof data.usage === 'object' ? (data.usage as JsonRecord) : undefined;
+  if (usage) target.usage = usage;
+
+  const phase = typeof data.phase === 'string' ? data.phase : 'other';
+  const deltaContent = typeof data.delta_content === 'string' ? data.delta_content : '';
+  const content = typeof data.content === 'string' ? data.content : '';
+  const done = data.done === true || phase === 'done';
+
+  if (phase === 'thinking') {
+    if (deltaContent) target.reasoningDeltas.push(deltaContent);
+    if (content) target.reasoningText = content;
+  } else if (phase === 'answer') {
+    if (deltaContent) target.answerDeltas.push(deltaContent);
+    if (content) target.assistantText = content;
+  }
+
+  return {
+    phase,
+    deltaContent,
+    content,
+    usage,
+    done,
+  };
+}
+
+function applyZaiSseBlock(target: ZaiParsedStream, block: string): ZaiStreamEvent[] {
+  const events: ZaiStreamEvent[] = [];
+  const lines = block
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('data:'));
+
+  for (const line of lines) {
+    const payload = line.slice(5).trim();
+    if (!payload) continue;
+    try {
+      const event = applyZaiSsePayload(target, payload);
+      if (event) events.push(event);
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  return events;
 }
 
 function unauthorized(res: ServerResponse): void {
@@ -524,7 +656,7 @@ function normalizeMessages(
             },
           };
         })
-        .filter((item): item is JsonRecord => Boolean(item));
+        .filter((item): item is NonNullable<typeof item> => Boolean(item));
 
       if (upstreamToolCalls.length > 0) {
         normalized.push({
@@ -903,67 +1035,21 @@ function interpretAssistantResponse(
 }
 
 function parseZaiEventStream(text: string): ZaiParsedStream {
-  const blocks = text.split(/\n\n+/g);
-  const answerDeltas: string[] = [];
-  let usage: JsonRecord | undefined;
-  let upstreamModel: string | null = null;
-  let created: number | null = null;
-  let fallbackContent = '';
-  let upstreamError: string | null = null;
+  const parsed = createEmptyParsedStream();
+  const { blocks, rest } = drainSseBlocks(text);
 
   for (const block of blocks) {
     const trimmed = block.trim();
     if (!trimmed) continue;
-
-    const lines = trimmed
-      .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith('data:'));
-
-    for (const line of lines) {
-      const payload = line.slice(5).trim();
-      if (!payload || payload === '[DONE]') continue;
-
-      try {
-        const parsed = JSON.parse(payload) as JsonRecord;
-        if (typeof parsed.model === 'string' && !upstreamModel) upstreamModel = parsed.model;
-        if (typeof parsed.created === 'number' && !created) created = parsed.created;
-
-        if (parsed.data === '[DONE]') continue;
-        if (!parsed.data || typeof parsed.data !== 'object') continue;
-
-        const data = parsed.data as JsonRecord;
-        const error = data.error;
-        if (error && typeof error === 'object') {
-          const errorRecord = error as JsonRecord;
-          upstreamError = String(errorRecord.detail || errorRecord.message || 'Unknown upstream error');
-          continue;
-        }
-
-        if (data.usage && typeof data.usage === 'object') usage = data.usage as JsonRecord;
-
-        const phase = typeof data.phase === 'string' ? data.phase : '';
-        const deltaContent = typeof data.delta_content === 'string' ? data.delta_content : '';
-        const content = typeof data.content === 'string' ? data.content : '';
-
-        if (phase === 'answer' && deltaContent) answerDeltas.push(deltaContent);
-        if (phase === 'answer' && content) fallbackContent = content;
-      } catch {
-        // 忽略无法解析的 data 段
-      }
-    }
+    applyZaiSseBlock(parsed, trimmed);
   }
 
-  if (upstreamError) throw new Error(upstreamError);
+  const remaining = rest.trim();
+  if (remaining) {
+    applyZaiSseBlock(parsed, remaining);
+  }
 
-  const assistantText = answerDeltas.length > 0 ? answerDeltas.join('') : fallbackContent;
-  return {
-    answerDeltas: answerDeltas.length > 0 ? answerDeltas : assistantText ? [assistantText] : [],
-    assistantText,
-    usage,
-    upstreamModel,
-    created,
-  };
+  return finalizeParsedStream(parsed);
 }
 
 function buildModelListPayload(models: ZaiModelDescriptor[]) {
@@ -1009,18 +1095,23 @@ function buildChatCompletionResponse(
   const promptText = (request.messages || [])
     .map((item) => flattenContent(item.content))
     .join('\n');
-  const completionText = assistantResponse.mode === 'assistant' ? assistantResponse.content : '';
+  const completionText =
+    assistantResponse.mode === 'assistant'
+      ? [parsed.reasoningText, assistantResponse.content].filter(Boolean).join('\n')
+      : parsed.reasoningText;
   const finishReason = assistantResponse.mode === 'tool_calls' ? 'tool_calls' : 'stop';
   const message =
     assistantResponse.mode === 'tool_calls'
       ? {
           role: 'assistant',
           content: null,
+          reasoning_content: parsed.reasoningText || undefined,
           tool_calls: assistantResponse.toolCalls,
         }
       : {
           role: 'assistant',
-          content: completionText,
+          content: assistantResponse.content,
+          reasoning_content: parsed.reasoningText || undefined,
         };
 
   return {
@@ -1040,6 +1131,78 @@ function buildChatCompletionResponse(
   };
 }
 
+function buildStreamChunkEnvelope(
+  id: string,
+  created: number,
+  model: string,
+  delta: JsonRecord,
+  finishReason: string | null
+) {
+  return {
+    id,
+    object: 'chat.completion.chunk',
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta,
+        finish_reason: finishReason,
+      },
+    ],
+  };
+}
+
+function buildRoleStreamChunk(id: string, created: number, model: string) {
+  return buildStreamChunkEnvelope(id, created, model, { role: 'assistant' }, null);
+}
+
+function buildReasoningStreamChunk(id: string, created: number, model: string, reasoningDelta: string) {
+  return buildStreamChunkEnvelope(id, created, model, { reasoning_content: reasoningDelta }, null);
+}
+
+function buildContentStreamChunk(id: string, created: number, model: string, contentDelta: string) {
+  return buildStreamChunkEnvelope(id, created, model, { content: contentDelta }, null);
+}
+
+function buildToolCallStreamChunks(
+  id: string,
+  created: number,
+  model: string,
+  toolCalls: NormalizedToolCall[]
+) {
+  return toolCalls.map((toolCall, index) =>
+    buildStreamChunkEnvelope(
+      id,
+      created,
+      model,
+      {
+        tool_calls: [
+          {
+            index,
+            id: toolCall.id,
+            type: 'function',
+            function: {
+              name: toolCall.function.name,
+              arguments: toolCall.function.arguments,
+            },
+          },
+        ],
+      },
+      null
+    )
+  );
+}
+
+function buildFinishStreamChunk(
+  id: string,
+  created: number,
+  model: string,
+  finishReason: 'stop' | 'tool_calls'
+) {
+  return buildStreamChunkEnvelope(id, created, model, {}, finishReason);
+}
+
 function buildStreamChunks(
   request: OpenAIChatRequest,
   parsed: ZaiParsedStream,
@@ -1048,81 +1211,25 @@ function buildStreamChunks(
   const created = parsed.created ?? Math.floor(Date.now() / 1000);
   const responseModel = request.model || parsed.upstreamModel || DEFAULT_MODEL;
   const id = `chatcmpl_${randomUUID().replace(/-/g, '')}`;
-  const chunks: unknown[] = [
-    {
-      id,
-      object: 'chat.completion.chunk',
-      created,
-      model: responseModel,
-      choices: [
-        {
-          index: 0,
-          delta: { role: 'assistant' },
-          finish_reason: null,
-        },
-      ],
-    },
-  ];
+  const chunks: unknown[] = [buildRoleStreamChunk(id, created, responseModel)];
 
   if (assistantResponse.mode === 'tool_calls') {
-    assistantResponse.toolCalls.forEach((toolCall, index) => {
-      chunks.push({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model: responseModel,
-        choices: [
-          {
-            index: 0,
-            delta: {
-              tool_calls: [
-                {
-                  index,
-                  id: toolCall.id,
-                  type: 'function',
-                  function: {
-                    name: toolCall.function.name,
-                    arguments: toolCall.function.arguments,
-                  },
-                },
-              ],
-            },
-            finish_reason: null,
-          },
-        ],
-      });
-    });
+    for (const delta of parsed.reasoningDeltas) {
+      chunks.push(buildReasoningStreamChunk(id, created, responseModel, delta));
+    }
+
+    chunks.push(...buildToolCallStreamChunks(id, created, responseModel, assistantResponse.toolCalls));
   } else {
+    for (const delta of parsed.reasoningDeltas) {
+      chunks.push(buildReasoningStreamChunk(id, created, responseModel, delta));
+    }
+
     for (const delta of parsed.answerDeltas) {
-      chunks.push({
-        id,
-        object: 'chat.completion.chunk',
-        created,
-        model: responseModel,
-        choices: [
-          {
-            index: 0,
-            delta: { content: delta },
-            finish_reason: null,
-          },
-        ],
-      });
+      chunks.push(buildContentStreamChunk(id, created, responseModel, delta));
     }
   }
 
-  chunks.push({
-    id,
-    object: 'chat.completion.chunk',
-    created,
-    model: responseModel,
-    choices: [
-      {
-        index: 0,
-        delta: {},
-        finish_reason: assistantResponse.mode === 'tool_calls' ? 'tool_calls' : 'stop',
-      },
-    ],
-  });
+  chunks.push(buildFinishStreamChunk(id, created, responseModel, assistantResponse.mode === 'tool_calls' ? 'tool_calls' : 'stop'));
 
   return chunks;
 }
@@ -1141,6 +1248,78 @@ async function buildResponseError(response: Response): Promise<Error> {
   } catch {
     return new Error(text || `HTTP ${response.status}`);
   }
+}
+
+async function relayUpstreamSseToOpenAI(params: {
+  res: ServerResponse;
+  upstreamResponse: Response;
+  request: OpenAIChatRequest;
+  allowIncrementalAnswer: boolean;
+  streamId: string;
+  created: number;
+  model: string;
+}): Promise<{ parsed: ZaiParsedStream; streamedReasoningCount: number; streamedAnswerCount: number }> {
+  const { res, upstreamResponse, request, allowIncrementalAnswer, streamId, created, model } = params;
+  const parsed = createEmptyParsedStream();
+  const reader = upstreamResponse.body?.getReader();
+  if (!reader) throw new Error('上游流响应缺少 body');
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let streamedReasoningCount = 0;
+  let streamedAnswerCount = 0;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const drained = drainSseBlocks(buffer);
+    buffer = drained.rest;
+
+    for (const block of drained.blocks) {
+      const trimmed = block.trim();
+      if (!trimmed) continue;
+
+      const events = applyZaiSseBlock(parsed, trimmed);
+      for (const event of events) {
+        if (event.phase === 'thinking' && event.deltaContent) {
+          writeSseLine(res, buildReasoningStreamChunk(streamId, created, model, event.deltaContent));
+          streamedReasoningCount += 1;
+          continue;
+        }
+
+        if (event.phase === 'answer' && event.deltaContent && allowIncrementalAnswer) {
+          writeSseLine(res, buildContentStreamChunk(streamId, created, model, event.deltaContent));
+          streamedAnswerCount += 1;
+        }
+      }
+    }
+  }
+
+  buffer += decoder.decode();
+  const remaining = buffer.trim();
+  if (remaining) {
+    const events = applyZaiSseBlock(parsed, remaining);
+    for (const event of events) {
+      if (event.phase === 'thinking' && event.deltaContent) {
+        writeSseLine(res, buildReasoningStreamChunk(streamId, created, model, event.deltaContent));
+        streamedReasoningCount += 1;
+        continue;
+      }
+
+      if (event.phase === 'answer' && event.deltaContent && allowIncrementalAnswer) {
+        writeSseLine(res, buildContentStreamChunk(streamId, created, model, event.deltaContent));
+        streamedAnswerCount += 1;
+      }
+    }
+  }
+
+  return {
+    parsed: finalizeParsedStream(parsed),
+    streamedReasoningCount,
+    streamedAnswerCount,
+  };
 }
 
 class ZaiHttpBridge {
@@ -1452,6 +1631,26 @@ class ZaiHttpBridge {
     request: OpenAIChatRequest,
     normalizedMessages: ZaiUpstreamMessage[]
   ): Promise<ZaiParsedStream> {
+    const completionInput = this.buildCompletionInput(request, normalizedMessages);
+    const response = await this.openCompletionResponseWithRetry(completionInput);
+    const text = await response.text();
+    return parseZaiEventStream(text);
+  }
+
+  async completeStream(
+    request: OpenAIChatRequest,
+    normalizedMessages: ZaiUpstreamMessage[],
+    signal?: AbortSignal
+  ): Promise<Response> {
+    const completionInput = this.buildCompletionInput(request, normalizedMessages, signal);
+    return this.openCompletionResponseWithRetry(completionInput);
+  }
+
+  private buildCompletionInput(
+    request: OpenAIChatRequest,
+    normalizedMessages: ZaiUpstreamMessage[],
+    signal?: AbortSignal
+  ) {
     const model = normalizeWhitespace(request.model || '') || DEFAULT_MODEL;
     const originalMessages = Array.isArray(request.messages) ? request.messages : [];
     const currentUserPrompt =
@@ -1459,24 +1658,26 @@ class ZaiHttpBridge {
         ? this.extractCurrentUpstreamPrompt(normalizedMessages)
         : this.extractCurrentUserPrompt(originalMessages)) || 'Hello';
 
-    return this.completeWithRetry({
+    return {
       request,
       model,
       normalizedMessages,
       currentUserPrompt,
       retryAuth: true,
       retryVersion: true,
-    });
+      signal,
+    };
   }
 
-  private async completeWithRetry(input: {
+  private async openCompletionResponseWithRetry(input: {
     request: OpenAIChatRequest;
     model: string;
     normalizedMessages: ZaiUpstreamMessage[];
     currentUserPrompt: string;
     retryAuth: boolean;
     retryVersion: boolean;
-  }): Promise<ZaiParsedStream> {
+    signal?: AbortSignal;
+  }): Promise<Response> {
     const auth = await this.ensureAuth();
     const chat = await this.createChat(input.model, input.currentUserPrompt, auth);
     const signatureContext = this.buildSignatureContext(auth);
@@ -1521,24 +1722,22 @@ class ZaiHttpBridge {
           Referer: `${STARTUP_URL}/c/${chat.chatId}`,
         },
         body: JSON.stringify(completionBody),
-        signal: buildAbortSignal(),
+        signal: buildAbortSignal(input.signal),
       }
     );
 
     if (response.status === 401 && input.retryAuth) {
       this.clearAuth();
-      return this.completeWithRetry({ ...input, retryAuth: false });
+      return this.openCompletionResponseWithRetry({ ...input, retryAuth: false });
     }
 
     if (response.status === 426 && input.retryVersion) {
       this.clearFeVersion();
-      return this.completeWithRetry({ ...input, retryVersion: false });
+      return this.openCompletionResponseWithRetry({ ...input, retryVersion: false });
     }
 
     if (!response.ok) throw await buildResponseError(response);
-
-    const text = await response.text();
-    return parseZaiEventStream(text);
+    return response;
   }
 }
 
@@ -1615,6 +1814,126 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      const conversationHasToolResults = hasToolResults(originalMessages);
+      const mayRequireDeferredToolDecision =
+        normalizedTools.length > 0 && toolChoice.mode !== 'none' && !conversationHasToolResults;
+
+      if (body.stream) {
+        const abortController = new AbortController();
+        const abortUpstream = () => abortController.abort();
+        req.once('close', abortUpstream);
+
+        try {
+          const upstreamResponse = await bridge.completeStream(body, normalizedMessages, abortController.signal);
+          const created = Math.floor(Date.now() / 1000);
+          const responseModel = body.model || DEFAULT_MODEL;
+          const streamId = `chatcmpl_${randomUUID().replace(/-/g, '')}`;
+          const allowIncrementalAnswer = !mayRequireDeferredToolDecision;
+
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-cache, no-store',
+            Connection: 'keep-alive',
+            'X-Accel-Buffering': 'no',
+          });
+          res.socket?.setNoDelay(true);
+          res.flushHeaders();
+          writeSseLine(res, buildRoleStreamChunk(streamId, created, responseModel));
+
+          let parsed: ZaiParsedStream;
+          let streamedReasoningCount = 0;
+          let streamedAnswerCount = 0;
+
+          const relayed = await relayUpstreamSseToOpenAI({
+            res,
+            upstreamResponse,
+            request: body,
+            allowIncrementalAnswer,
+            streamId,
+            created,
+            model: responseModel,
+          });
+
+          parsed = relayed.parsed;
+          streamedReasoningCount = relayed.streamedReasoningCount;
+          streamedAnswerCount = relayed.streamedAnswerCount;
+
+          let assistantResponse = interpretAssistantResponse(body, parsed, normalizedTools);
+
+          if (
+            normalizedTools.length > 0 &&
+            toolChoice.mode !== 'none' &&
+            !conversationHasToolResults &&
+            assistantResponse.mode === 'assistant'
+          ) {
+            const repairMessages = buildToolRepairMessages(originalMessages, normalizedTools, parsed.assistantText);
+            const repairedRequest: OpenAIChatRequest = {
+              ...body,
+              messages: repairMessages,
+              stream: false,
+            };
+            const repairedNormalizedMessages = normalizeMessages(repairMessages, {
+              tools: normalizedTools,
+              toolChoice,
+              allowParallelToolCalls: body.parallel_tool_calls !== false,
+            });
+            const repairedParsed = await bridge.complete(repairedRequest, repairedNormalizedMessages);
+            const repairedAssistantResponse = interpretAssistantResponse(
+              repairedRequest,
+              repairedParsed,
+              normalizedTools
+            );
+            if (repairedAssistantResponse.mode === 'tool_calls') {
+              assistantResponse = repairedAssistantResponse;
+            }
+          }
+
+          if (streamedReasoningCount === 0 && parsed.reasoningText) {
+            writeSseLine(res, buildReasoningStreamChunk(streamId, created, responseModel, parsed.reasoningText));
+          }
+
+          if (assistantResponse.mode === 'tool_calls') {
+            for (const chunk of buildToolCallStreamChunks(streamId, created, responseModel, assistantResponse.toolCalls)) {
+              writeSseLine(res, chunk);
+            }
+          } else if (!allowIncrementalAnswer) {
+            const answerDeltas =
+              parsed.answerDeltas.length > 0 ? parsed.answerDeltas : parsed.assistantText ? [parsed.assistantText] : [];
+            if (streamedAnswerCount === 0) {
+              for (const delta of answerDeltas) {
+                writeSseLine(res, buildContentStreamChunk(streamId, created, responseModel, delta));
+              }
+            }
+          } else if (streamedAnswerCount === 0 && assistantResponse.content) {
+            writeSseLine(res, buildContentStreamChunk(streamId, created, responseModel, assistantResponse.content));
+          }
+
+          writeSseLine(
+            res,
+            buildFinishStreamChunk(streamId, created, responseModel, assistantResponse.mode === 'tool_calls' ? 'tool_calls' : 'stop')
+          );
+          writeSseLine(res, '[DONE]');
+          res.end();
+          return;
+        } catch (error) {
+          if (res.headersSent) {
+            writeSseLine(res, {
+              error: {
+                message: error instanceof Error ? error.message : String(error),
+                type: 'server_error',
+                code: 'stream_error',
+              },
+            });
+            writeSseLine(res, '[DONE]');
+            res.end();
+            return;
+          }
+          throw error;
+        } finally {
+          req.off('close', abortUpstream);
+        }
+      }
+
       let parsed = await bridge.complete(body, normalizedMessages);
       let assistantResponse = interpretAssistantResponse(body, parsed, normalizedTools);
 
@@ -1645,20 +1964,6 @@ const server = createServer(async (req, res) => {
           parsed = repairedParsed;
           assistantResponse = repairedAssistantResponse;
         }
-      }
-
-      if (body.stream) {
-        res.writeHead(200, {
-          'Content-Type': 'text/event-stream; charset=utf-8',
-          'Cache-Control': 'no-cache, no-store',
-          Connection: 'keep-alive',
-        });
-        for (const chunk of buildStreamChunks(body, parsed, assistantResponse)) {
-          writeSseLine(res, chunk);
-        }
-        writeSseLine(res, '[DONE]');
-        res.end();
-        return;
       }
 
       writeJson(res, 200, buildChatCompletionResponse(body, parsed, assistantResponse));

@@ -66,6 +66,7 @@ const SERVER_PATH = resolve(SERVER_WORKDIR, 'scripts/zai-openai-compatible.ts');
 const MODELS_ROUNDS = parseInt(process.env.ZAI_STRESS_MODELS_ROUNDS?.trim() || '10', 10);
 const BASIC_ROUNDS = parseInt(process.env.ZAI_STRESS_BASIC_ROUNDS?.trim() || '6', 10);
 const TOOL_ROUNDS = parseInt(process.env.ZAI_STRESS_TOOL_ROUNDS?.trim() || '4', 10);
+const STREAM_ROUNDS = parseInt(process.env.ZAI_STRESS_STREAM_ROUNDS?.trim() || '2', 10);
 const BURST_WAVES = parseInt(process.env.ZAI_STRESS_BURST_WAVES?.trim() || '2', 10);
 const BURST_CONCURRENCY = parseInt(process.env.ZAI_STRESS_BURST_CONCURRENCY?.trim() || '3', 10);
 const STARTUP_TIMEOUT_MS = parseInt(process.env.ZAI_STRESS_STARTUP_TIMEOUT_MS?.trim() || '30000', 10);
@@ -247,6 +248,117 @@ async function runBasicRound(): Promise<string> {
   return content;
 }
 
+async function runStreamReasoningRound(): Promise<string> {
+  const startedAt = Date.now();
+  const response = await fetch(`${BASE_URL}/v1/chat/completions`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'glm-5',
+      stream: true,
+      messages: [{ role: 'user', content: '请先简短思考，再只回答 1+1 的结果。' }],
+    }),
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`stream HTTP ${response.status}: ${await response.text()}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let firstReasoningLatencyMs = -1;
+  let firstContentLatencyMs = -1;
+  let finishReason = '';
+  let sawDone = false;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    buffer = buffer.replace(/\r\n/g, '\n');
+
+    let separatorIndex = buffer.indexOf('\n\n');
+    while (separatorIndex !== -1) {
+      const block = buffer.slice(0, separatorIndex);
+      buffer = buffer.slice(separatorIndex + 2);
+
+      const lines = block
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith('data:'));
+
+      for (const line of lines) {
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+        if (payload === '[DONE]') {
+          sawDone = true;
+          continue;
+        }
+
+        const parsed = JSON.parse(payload) as OpenAIChatResponse & { error?: JsonRecord };
+        if (parsed.error) {
+          throw new Error(`stream error: ${JSON.stringify(parsed.error)}`);
+        }
+
+        const choice = parsed.choices?.[0];
+        const deltaRecord =
+          choice?.message && typeof choice.message === 'object'
+            ? (choice.message as JsonRecord)
+            : choice && typeof choice === 'object'
+              ? ((choice as unknown as JsonRecord).delta as JsonRecord | undefined)
+              : undefined;
+
+        const reasoningContent =
+          deltaRecord && typeof deltaRecord.reasoning_content === 'string' ? deltaRecord.reasoning_content : '';
+        const content = deltaRecord && typeof deltaRecord.content === 'string' ? deltaRecord.content : '';
+
+        if (reasoningContent && firstReasoningLatencyMs === -1) {
+          firstReasoningLatencyMs = Date.now() - startedAt;
+        }
+
+        if (content && firstContentLatencyMs === -1) {
+          firstContentLatencyMs = Date.now() - startedAt;
+        }
+
+        if (typeof choice?.finish_reason === 'string') {
+          finishReason = choice.finish_reason;
+        }
+      }
+
+      separatorIndex = buffer.indexOf('\n\n');
+    }
+  }
+
+  if (firstReasoningLatencyMs === -1) {
+    throw new Error('未收到 reasoning_content 增量');
+  }
+
+  if (firstContentLatencyMs === -1) {
+    throw new Error('未收到 content 增量');
+  }
+
+  if (firstReasoningLatencyMs > firstContentLatencyMs) {
+    throw new Error(
+      `reasoning_content 晚于 content：reasoning=${firstReasoningLatencyMs}ms content=${firstContentLatencyMs}ms`
+    );
+  }
+
+  if (finishReason !== 'stop') {
+    throw new Error(`finish_reason=${String(finishReason)}`);
+  }
+
+  if (!sawDone) {
+    throw new Error('未收到 [DONE]');
+  }
+
+  return `reasoning=${firstReasoningLatencyMs}ms content=${firstContentLatencyMs}ms`;
+}
+
 async function runToolCycleRound(): Promise<string> {
   const firstPayload = (await fetchJson('/v1/chat/completions', {
     method: 'POST',
@@ -374,6 +486,7 @@ async function main(): Promise<void> {
     const phases: PhaseReport[] = [];
     phases.push(await runSequentialPhase('models', MODELS_ROUNDS, runModelsRound));
     phases.push(await runSequentialPhase('basic', BASIC_ROUNDS, runBasicRound));
+    phases.push(await runSequentialPhase('stream_reasoning', STREAM_ROUNDS, runStreamReasoningRound));
     phases.push(await runSequentialPhase('tool_cycle', TOOL_ROUNDS, runToolCycleRound));
     phases.push(
       await runSequentialPhase('basic_burst', BURST_WAVES, () => runBurstBasicRound(BURST_CONCURRENCY))
@@ -389,6 +502,7 @@ async function main(): Promise<void> {
         useExistingServer,
         modelsRounds: MODELS_ROUNDS,
         basicRounds: BASIC_ROUNDS,
+        streamRounds: STREAM_ROUNDS,
         toolRounds: TOOL_ROUNDS,
         burstWaves: BURST_WAVES,
         burstConcurrency: BURST_CONCURRENCY,
