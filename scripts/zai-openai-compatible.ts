@@ -152,6 +152,10 @@ const FE_VERSION_CACHE_TTL_MS = parseInt(
 );
 const ENABLE_THINKING = parseBoolean(process.env.ZAI_ENABLE_THINKING, true);
 const PREVIEW_MODE = parseBoolean(process.env.ZAI_PREVIEW_MODE, true);
+const MIRROR_REASONING_TO_CONTENT = parseBoolean(
+  process.env.ZAI_MIRROR_REASONING_TO_CONTENT,
+  true
+);
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (value == null || value === '') return fallback;
@@ -246,6 +250,8 @@ function writeJson(res: ServerResponse, statusCode: number, payload: unknown): v
 
 function writeSseLine(res: ServerResponse, payload: unknown): void {
   res.write(`data: ${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n\n`);
+  const flush = (res as ServerResponse & { flush?: () => void }).flush;
+  if (typeof flush === 'function') flush.call(res);
 }
 
 function createEmptyParsedStream(): ZaiParsedStream {
@@ -1106,12 +1112,14 @@ function buildChatCompletionResponse(
           role: 'assistant',
           content: null,
           reasoning_content: parsed.reasoningText || undefined,
+          reasoning: parsed.reasoningText || undefined,
           tool_calls: assistantResponse.toolCalls,
         }
       : {
           role: 'assistant',
           content: assistantResponse.content,
           reasoning_content: parsed.reasoningText || undefined,
+          reasoning: parsed.reasoningText || undefined,
         };
 
   return {
@@ -1158,7 +1166,17 @@ function buildRoleStreamChunk(id: string, created: number, model: string) {
 }
 
 function buildReasoningStreamChunk(id: string, created: number, model: string, reasoningDelta: string) {
-  return buildStreamChunkEnvelope(id, created, model, { reasoning_content: reasoningDelta }, null);
+  return buildStreamChunkEnvelope(
+    id,
+    created,
+    model,
+    {
+      reasoning_content: reasoningDelta,
+      reasoning: reasoningDelta,
+      ...(MIRROR_REASONING_TO_CONTENT ? { content: reasoningDelta } : {}),
+    },
+    null
+  );
 }
 
 function buildContentStreamChunk(id: string, created: number, model: string, contentDelta: string) {

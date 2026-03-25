@@ -56,9 +56,11 @@
 并且上游返回 thinking 阶段时，代理会实时输出：
 
 - `choices[0].delta.reasoning_content`：思维链增量
-- `choices[0].delta.content`：最终答案增量
+- `choices[0].delta.content`：客户端可见文本增量（默认会先镜像思维链，随后再输出最终答案）
 
 也就是说，客户端会先收到 reasoning，再收到最终 answer，而不是等上游完整结束后一次性下发。
+
+另外，为了兼容一些**只读取 `delta.content`** 的通用 OpenAI 客户端，代理默认还会把 thinking 增量镜像到 `delta.content`。这样即使客户端不认识 `reasoning_content` 字段，仍然能看到思考链在实时输出。
 
 ### 2. 纯 HTTP，无需浏览器常驻
 

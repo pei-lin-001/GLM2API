@@ -272,6 +272,7 @@ async function runStreamReasoningRound(): Promise<string> {
   let buffer = '';
   let firstReasoningLatencyMs = -1;
   let firstContentLatencyMs = -1;
+  let contentChunkCount = 0;
   let finishReason = '';
   let sawDone = false;
 
@@ -321,8 +322,11 @@ async function runStreamReasoningRound(): Promise<string> {
           firstReasoningLatencyMs = Date.now() - startedAt;
         }
 
-        if (content && firstContentLatencyMs === -1) {
-          firstContentLatencyMs = Date.now() - startedAt;
+        if (content) {
+          contentChunkCount += 1;
+          if (firstContentLatencyMs === -1) {
+            firstContentLatencyMs = Date.now() - startedAt;
+          }
         }
 
         if (typeof choice?.finish_reason === 'string') {
@@ -356,7 +360,11 @@ async function runStreamReasoningRound(): Promise<string> {
     throw new Error('未收到 [DONE]');
   }
 
-  return `reasoning=${firstReasoningLatencyMs}ms content=${firstContentLatencyMs}ms`;
+  if (contentChunkCount < 2) {
+    throw new Error(`content 增量分片过少：${contentChunkCount}`);
+  }
+
+  return `reasoning=${firstReasoningLatencyMs}ms content=${firstContentLatencyMs}ms contentChunks=${contentChunkCount}`;
 }
 
 async function runToolCycleRound(): Promise<string> {
