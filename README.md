@@ -136,6 +136,12 @@ bash scripts/deploy-zai-linux.sh restart
 bash scripts/deploy-zai-linux.sh stop
 ```
 
+如果你想直接验证“是否真的在流式输出思考链”，可以运行仓库内置的验收脚本：
+
+```bash
+ZAI_VERIFY_BASE_URL=http://127.0.0.1:8788 pnpm run zai:verify-stream
+```
+
 ---
 
 ## 接口验证
@@ -185,6 +191,31 @@ curl -N http://127.0.0.1:8788/v1/chat/completions \
 1. 先出现 `reasoning_content`
 2. 后出现 `content`
 3. 最后出现 `finish_reason=stop` 和 `[DONE]`
+
+### 3.2）使用仓库内置脚本验 reasoning 流
+
+```bash
+ZAI_VERIFY_BASE_URL=http://127.0.0.1:8788 pnpm run zai:verify-stream
+```
+
+这个脚本会打印每个 chunk 的到达时间，例如：
+
+```text
+[1ms] reasoning: \"用户希望我简短\"
+[1ms] content: \"用户希望我简短\"
+...
+[3468ms] finish_reason: stop
+[3468ms] [DONE]
+```
+
+最后还会输出汇总：
+
+- `firstReasoningAt`
+- `firstContentAt`
+- `reasoningChunkCount`
+- `contentChunkCount`
+- `finishReason`
+- `sawDone`
 
 ### 4）工具调用（首轮）
 

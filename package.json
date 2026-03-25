@@ -7,7 +7,8 @@
   "description": "OpenAI Compatible HTTP bridge for chat.z.ai with Linux one-command deployment",
   "scripts": {
     "zai:openai": "tsx scripts/zai-openai-compatible.ts",
-    "zai:stress": "tsx scripts/zai-stress-test.ts"
+    "zai:stress": "tsx scripts/zai-stress-test.ts",
+    "zai:verify-stream": "node scripts/verify-stream-behavior.mjs"
   },
   "engines": {
     "node": ">=20.0.0"
