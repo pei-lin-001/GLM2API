@@ -35,6 +35,8 @@ let firstReasoningAt = -1;
 let firstContentAt = -1;
 let finishReason = '';
 let sawDone = false;
+let sawMixedReasoningContentChunk = false;
+let sawFinalAnswerBeforeReasoning = false;
 
 while (true) {
   const { value, done } = await reader.read();
@@ -65,17 +67,24 @@ while (true) {
       const parsed = JSON.parse(rawPayload);
       const choice = parsed?.choices?.[0] || {};
       const delta = choice?.delta || {};
+      const phase = typeof delta.phase === 'string' ? delta.phase : '';
 
       if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
         reasoningChunkCount += 1;
         if (firstReasoningAt === -1) firstReasoningAt = currentMs;
-        console.log(`[${currentMs}ms] reasoning: ${JSON.stringify(delta.reasoning_content)}`);
+        if (typeof delta.content === 'string' && delta.content) {
+          sawMixedReasoningContentChunk = true;
+        }
+        console.log(
+          `[${currentMs}ms] reasoning${phase ? `(${phase})` : ''}: ${JSON.stringify(delta.reasoning_content)}`
+        );
       }
 
       if (typeof delta.content === 'string' && delta.content) {
         contentChunkCount += 1;
         if (firstContentAt === -1) firstContentAt = currentMs;
-        console.log(`[${currentMs}ms] content: ${JSON.stringify(delta.content)}`);
+        if (firstReasoningAt === -1) sawFinalAnswerBeforeReasoning = true;
+        console.log(`[${currentMs}ms] content${phase ? `(${phase})` : ''}: ${JSON.stringify(delta.content)}`);
       }
 
       if (choice?.finish_reason) {
@@ -99,6 +108,8 @@ console.log(
       contentChunkCount,
       finishReason,
       sawDone,
+      sawMixedReasoningContentChunk,
+      sawFinalAnswerBeforeReasoning,
     },
     null,
     2
@@ -107,6 +118,7 @@ console.log(
 
 if (firstReasoningAt === -1) throw new Error('未观察到 reasoning_content');
 if (firstContentAt === -1) throw new Error('未观察到 content');
-if (contentChunkCount < 2) throw new Error(`content 分片过少：${contentChunkCount}`);
 if (!sawDone) throw new Error('未观察到 [DONE]');
 if (finishReason !== 'stop') throw new Error(`finish_reason 异常：${finishReason}`);
+if (sawMixedReasoningContentChunk) throw new Error('reasoning_content 与 content 混在同一增量分片');
+if (sawFinalAnswerBeforeReasoning) throw new Error('在 reasoning_content 之前就先收到了正文 content');

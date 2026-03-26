@@ -275,6 +275,8 @@ async function runStreamReasoningRound(): Promise<string> {
   let contentChunkCount = 0;
   let finishReason = '';
   let sawDone = false;
+  let sawMixedReasoningContentChunk = false;
+  let sawFinalAnswerBeforeReasoning = false;
 
   while (true) {
     const { value, done } = await reader.read();
@@ -321,9 +323,15 @@ async function runStreamReasoningRound(): Promise<string> {
         if (reasoningContent && firstReasoningLatencyMs === -1) {
           firstReasoningLatencyMs = Date.now() - startedAt;
         }
+        if (reasoningContent && content) {
+          sawMixedReasoningContentChunk = true;
+        }
 
         if (content) {
           contentChunkCount += 1;
+          if (firstReasoningLatencyMs === -1) {
+            sawFinalAnswerBeforeReasoning = true;
+          }
           if (firstContentLatencyMs === -1) {
             firstContentLatencyMs = Date.now() - startedAt;
           }
@@ -360,8 +368,12 @@ async function runStreamReasoningRound(): Promise<string> {
     throw new Error('未收到 [DONE]');
   }
 
-  if (contentChunkCount < 2) {
-    throw new Error(`content 增量分片过少：${contentChunkCount}`);
+  if (sawMixedReasoningContentChunk) {
+    throw new Error('reasoning_content 与 content 混在同一增量分片');
+  }
+
+  if (sawFinalAnswerBeforeReasoning) {
+    throw new Error('在 reasoning_content 之前就先收到了正文 content');
   }
 
   return `reasoning=${firstReasoningLatencyMs}ms content=${firstContentLatencyMs}ms contentChunks=${contentChunkCount}`;

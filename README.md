@@ -56,11 +56,26 @@
 并且上游返回 thinking 阶段时，代理会实时输出：
 
 - `choices[0].delta.reasoning_content`：思维链增量
-- `choices[0].delta.content`：客户端可见文本增量（默认会先镜像思维链，随后再输出最终答案）
+- `choices[0].delta.content`：最终答案增量
+- `choices[0].delta.phase="commentary"`：思考阶段
+- `choices[0].delta.phase="final_answer"`：正文阶段
 
 也就是说，客户端会先收到 reasoning，再收到最终 answer，而不是等上游完整结束后一次性下发。
 
-另外，为了兼容一些**只读取 `delta.content`** 的通用 OpenAI 客户端，代理默认还会把 thinking 增量镜像到 `delta.content`。这样即使客户端不认识 `reasoning_content` 字段，仍然能看到思考链在实时输出。
+默认情况下，代理**不会**再把思考链镜像进 `delta.content`，避免把“思考内容”和“正文内容”混在一起。
+
+如果你确实要兼容某些**只能读取 `delta.content`** 的旧客户端，可以显式开启：
+
+```bash
+ZAI_MIRROR_REASONING_TO_CONTENT=1
+```
+
+但这会让 reasoning 和正文混在同一条文本流里，不适合严格区分两个阶段的场景。
+
+设计参考：
+
+- OpenAI Responses API streaming 文档：正文采用独立输出事件，而不是把 reasoning 混进最终正文
+- OpenAI 输出消息里的 `phase` 语义：可区分 `commentary` 和 `final_answer`
 
 ### 2. 纯 HTTP，无需浏览器常驻
 
@@ -216,9 +231,9 @@ ZAI_VERIFY_BASE_URL=http://127.0.0.1:8788 pnpm run zai:verify-stream
 这个脚本会打印每个 chunk 的到达时间，例如：
 
 ```text
-[1ms] reasoning: \"用户希望我简短\"
-[1ms] content: \"用户希望我简短\"
+[1ms] reasoning(commentary): \"用户希望我简短\"
 ...
+[3376ms] content(final_answer): \"2\"
 [3468ms] finish_reason: stop
 [3468ms] [DONE]
 ```

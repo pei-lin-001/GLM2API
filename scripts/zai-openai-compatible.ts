@@ -155,7 +155,7 @@ const ENABLE_THINKING = parseBoolean(process.env.ZAI_ENABLE_THINKING, true);
 const PREVIEW_MODE = parseBoolean(process.env.ZAI_PREVIEW_MODE, true);
 const MIRROR_REASONING_TO_CONTENT = parseBoolean(
   process.env.ZAI_MIRROR_REASONING_TO_CONTENT,
-  true
+  false
 );
 
 function resolveBuildVersion(): string {
@@ -1129,6 +1129,7 @@ function buildChatCompletionResponse(
       ? {
           role: 'assistant',
           content: null,
+          phase: 'commentary',
           reasoning_content: parsed.reasoningText || undefined,
           reasoning: parsed.reasoningText || undefined,
           tool_calls: assistantResponse.toolCalls,
@@ -1136,6 +1137,7 @@ function buildChatCompletionResponse(
       : {
           role: 'assistant',
           content: assistantResponse.content,
+          phase: 'final_answer',
           reasoning_content: parsed.reasoningText || undefined,
           reasoning: parsed.reasoningText || undefined,
         };
@@ -1189,6 +1191,7 @@ function buildReasoningStreamChunk(id: string, created: number, model: string, r
     created,
     model,
     {
+      phase: 'commentary',
       reasoning_content: reasoningDelta,
       reasoning: reasoningDelta,
       ...(MIRROR_REASONING_TO_CONTENT ? { content: reasoningDelta } : {}),
@@ -1198,7 +1201,7 @@ function buildReasoningStreamChunk(id: string, created: number, model: string, r
 }
 
 function buildContentStreamChunk(id: string, created: number, model: string, contentDelta: string) {
-  return buildStreamChunkEnvelope(id, created, model, { content: contentDelta }, null);
+  return buildStreamChunkEnvelope(id, created, model, { phase: 'final_answer', content: contentDelta }, null);
 }
 
 function buildToolCallStreamChunks(
