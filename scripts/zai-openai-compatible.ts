@@ -1,6 +1,5 @@
 import { createHmac, randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { execSync } from 'node:child_process';
 import { URL } from 'node:url';
 
 type JsonRecord = Record<string, unknown>;
@@ -100,22 +99,22 @@ type ZaiModelDescriptor = {
   raw: JsonRecord;
 };
 
+type ZaiStreamPhase = 'reasoning' | 'answer' | 'other' | 'done';
+
+type ZaiStreamEvent = {
+  phase: ZaiStreamPhase;
+  deltaContent: string;
+};
+
 type ZaiParsedStream = {
   reasoningDeltas: string[];
   reasoningText: string;
   answerDeltas: string[];
   assistantText: string;
+  streamEvents: ZaiStreamEvent[];
   usage?: JsonRecord;
   upstreamModel: string | null;
   created: number | null;
-};
-
-type ZaiStreamEvent = {
-  phase: string;
-  deltaContent: string;
-  content: string;
-  usage?: JsonRecord;
-  done: boolean;
 };
 
 const HOST = process.env.ZAI_OPENAI_HOST?.trim() || '127.0.0.1';
@@ -153,27 +152,6 @@ const FE_VERSION_CACHE_TTL_MS = parseInt(
 );
 const ENABLE_THINKING = parseBoolean(process.env.ZAI_ENABLE_THINKING, true);
 const PREVIEW_MODE = parseBoolean(process.env.ZAI_PREVIEW_MODE, true);
-const MIRROR_REASONING_TO_CONTENT = parseBoolean(
-  process.env.ZAI_MIRROR_REASONING_TO_CONTENT,
-  false
-);
-
-function resolveBuildVersion(): string {
-  const envValue = process.env.ZAI_BUILD_VERSION?.trim();
-  if (envValue) return envValue;
-
-  try {
-    return execSync('git rev-parse --short HEAD', {
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-      .toString('utf8')
-      .trim();
-  } catch {
-    return 'unknown';
-  }
-}
-
-const BUILD_VERSION = resolveBuildVersion();
 
 function parseBoolean(value: string | undefined, fallback: boolean): boolean {
   if (value == null || value === '') return fallback;
@@ -187,6 +165,13 @@ function normalizeWhitespace(value: string): string {
 function approximateTokens(text: string): number {
   if (!text) return 0;
   return Math.max(1, Math.ceil(text.length / 4));
+}
+
+function normalizeUpstreamPhase(value: string): ZaiStreamPhase {
+  if (value === 'thinking') return 'reasoning';
+  if (value === 'answer') return 'answer';
+  if (value === 'done') return 'done';
+  return 'other';
 }
 
 function flattenContent(content: unknown): string {
@@ -268,130 +253,6 @@ function writeJson(res: ServerResponse, statusCode: number, payload: unknown): v
 
 function writeSseLine(res: ServerResponse, payload: unknown): void {
   res.write(`data: ${typeof payload === 'string' ? payload : JSON.stringify(payload)}\n\n`);
-  const flush = (res as ServerResponse & { flush?: () => void }).flush;
-  if (typeof flush === 'function') flush.call(res);
-}
-
-function createEmptyParsedStream(): ZaiParsedStream {
-  return {
-    reasoningDeltas: [],
-    reasoningText: '',
-    answerDeltas: [],
-    assistantText: '',
-    usage: undefined,
-    upstreamModel: null,
-    created: null,
-  };
-}
-
-function finalizeParsedStream(parsed: ZaiParsedStream): ZaiParsedStream {
-  const reasoningText =
-    parsed.reasoningDeltas.length > 0 ? parsed.reasoningDeltas.join('') : parsed.reasoningText;
-  const assistantText =
-    parsed.answerDeltas.length > 0 ? parsed.answerDeltas.join('') : parsed.assistantText;
-
-  return {
-    ...parsed,
-    reasoningDeltas: parsed.reasoningDeltas.length > 0 ? parsed.reasoningDeltas : reasoningText ? [reasoningText] : [],
-    reasoningText,
-    answerDeltas: parsed.answerDeltas.length > 0 ? parsed.answerDeltas : assistantText ? [assistantText] : [],
-    assistantText,
-  };
-}
-
-function drainSseBlocks(buffer: string): { blocks: string[]; rest: string } {
-  let normalized = buffer.replace(/\r\n/g, '\n');
-  const blocks: string[] = [];
-
-  while (true) {
-    const separatorIndex = normalized.indexOf('\n\n');
-    if (separatorIndex === -1) break;
-    blocks.push(normalized.slice(0, separatorIndex));
-    normalized = normalized.slice(separatorIndex + 2);
-  }
-
-  return {
-    blocks,
-    rest: normalized,
-  };
-}
-
-function applyZaiSsePayload(target: ZaiParsedStream, payload: string): ZaiStreamEvent | null {
-  if (!payload || payload === '[DONE]') {
-    return {
-      phase: 'done',
-      deltaContent: '',
-      content: '',
-      done: true,
-    };
-  }
-
-  const parsed = JSON.parse(payload) as JsonRecord;
-  if (typeof parsed.model === 'string' && !target.upstreamModel) target.upstreamModel = parsed.model;
-  if (typeof parsed.created === 'number' && !target.created) target.created = parsed.created;
-
-  if (parsed.data === '[DONE]') {
-    return {
-      phase: 'done',
-      deltaContent: '',
-      content: '',
-      done: true,
-    };
-  }
-
-  if (!parsed.data || typeof parsed.data !== 'object') return null;
-
-  const data = parsed.data as JsonRecord;
-  const error = data.error;
-  if (error && typeof error === 'object') {
-    const errorRecord = error as JsonRecord;
-    throw new Error(String(errorRecord.detail || errorRecord.message || 'Unknown upstream error'));
-  }
-
-  const usage = data.usage && typeof data.usage === 'object' ? (data.usage as JsonRecord) : undefined;
-  if (usage) target.usage = usage;
-
-  const phase = typeof data.phase === 'string' ? data.phase : 'other';
-  const deltaContent = typeof data.delta_content === 'string' ? data.delta_content : '';
-  const content = typeof data.content === 'string' ? data.content : '';
-  const done = data.done === true || phase === 'done';
-
-  if (phase === 'thinking') {
-    if (deltaContent) target.reasoningDeltas.push(deltaContent);
-    if (content) target.reasoningText = content;
-  } else if (phase === 'answer') {
-    if (deltaContent) target.answerDeltas.push(deltaContent);
-    if (content) target.assistantText = content;
-  }
-
-  return {
-    phase,
-    deltaContent,
-    content,
-    usage,
-    done,
-  };
-}
-
-function applyZaiSseBlock(target: ZaiParsedStream, block: string): ZaiStreamEvent[] {
-  const events: ZaiStreamEvent[] = [];
-  const lines = block
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith('data:'));
-
-  for (const line of lines) {
-    const payload = line.slice(5).trim();
-    if (!payload) continue;
-    try {
-      const event = applyZaiSsePayload(target, payload);
-      if (event) events.push(event);
-    } catch (error) {
-      throw error;
-    }
-  }
-
-  return events;
 }
 
 function unauthorized(res: ServerResponse): void {
@@ -504,6 +365,8 @@ function buildToolInstructionMessage(
       '2. 如果输出 tool_calls，arguments 必须是 JSON 对象，不要把 arguments 写成字符串。',
       '3. 只能调用下方列出的函数。',
       '4. 如果没有必要调用函数，就输出 final。',
+      '4.1 不要先说“我将调用某个工具”或“好的，我来查询”，直接输出规定格式。',
+      '4.2 不要输出 Tool call、Tool calls、工具调用、调用工具、参数说明、Markdown 列表、代码块或自然语言解释。',
       `5. ${choiceInstruction}`,
       `6. ${resultInstruction}`,
       `7. ${allowParallelToolCalls ? '允许一次返回多个 tool_calls。' : '最多只能返回一个 tool_call。'}`,
@@ -579,13 +442,24 @@ function buildToolFinalizationMessages(messages: OpenAIMessage[]): ZaiUpstreamMe
 function buildToolRepairMessages(
   messages: OpenAIMessage[],
   tools: NormalizedToolDefinition[],
-  assistantDraft: string
+  assistantDraft: string,
+  toolChoice: NormalizedToolChoice,
+  allowParallelToolCalls: boolean
 ): OpenAIMessage[] {
   const originalUserPrompt =
     [...messages]
       .reverse()
       .find((message) => (message.role || '').toLowerCase() === 'user' && flattenContent(message.content).trim())
       ?.content ?? '';
+
+  const choiceInstruction =
+    toolChoice.mode === 'required'
+      ? '这一次必须输出 tool_calls，不能输出 final。'
+      : toolChoice.mode === 'function'
+        ? `这一次必须且只能调用函数 ${toolChoice.name}。`
+        : toolChoice.mode === 'none'
+          ? '这一次不要调用任何函数。'
+          : '如果用户请求依赖外部信息或动作，就输出 tool_calls。';
 
   return [
     {
@@ -597,6 +471,10 @@ function buildToolRepairMessages(
         '如果需要调用函数，只能从给定 tools 中选择。',
         '严格输出一个 XML 包裹块或纯 JSON 数组，不要输出解释。',
         '<openai_tool_response>{"mode":"tool_calls","tool_calls":[{"name":"函数名","arguments":{"key":"value"}}]}</openai_tool_response>',
+        '不要输出“好的，我将调用工具”之类的前置说明。',
+        '不要输出 Markdown 代码块、不要输出 Tool calls:、不要输出 name/arguments 的项目符号列表。',
+        `并行要求：${allowParallelToolCalls ? '允许多个 tool_calls。' : '最多只能输出一个 tool_call。'}`,
+        `本轮要求：${choiceInstruction}`,
         `可用 tools: ${JSON.stringify(tools)}`,
       ].join('\n'),
     },
@@ -680,7 +558,7 @@ function normalizeMessages(
             },
           };
         })
-        .filter((item): item is NonNullable<typeof item> => Boolean(item));
+        .filter((item): item is JsonRecord => Boolean(item));
 
       if (upstreamToolCalls.length > 0) {
         normalized.push({
@@ -728,6 +606,74 @@ function extractTaggedToolResponse(text: string): string | null {
   return match[1]?.trim() || null;
 }
 
+function sanitizeToolResponseText(text: string): string {
+  return text
+    .replace(/```(?:json|javascript|js)?/gi, '')
+    .replace(/```/g, '')
+    .replace(/\*\*/g, '')
+    .replace(/__/g, '')
+    .replace(/`/g, '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\r/g, '');
+}
+
+function escapeJsonString(value: string): string {
+  return JSON.stringify(value).slice(1, -1);
+}
+
+function normalizeJsonLikeCandidate(candidate: string): string {
+  return candidate
+    .trim()
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/\bNone\b/g, 'null')
+    .replace(/\bTrue\b/g, 'true')
+    .replace(/\bFalse\b/g, 'false')
+    .replace(/([{,]\s*)([A-Za-z_][\w-]*)(\s*:)/g, '$1"$2"$3')
+    .replace(/'([^'\\]*(?:\\.[^'\\]*)*)'(?=\s*:)/g, (_, key: string) => `"${escapeJsonString(key)}"`)
+    .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, value: string) => `: "${escapeJsonString(value)}"`)
+    .replace(/([\[,]\s*)'([^'\\]*(?:\\.[^'\\]*)*)'(?=\s*[,}\]])/g, (_, prefix: string, value: string) => {
+      return `${prefix}"${escapeJsonString(value)}"`;
+    });
+}
+
+function parseJsonLikeValue(candidate: string): unknown {
+  const normalizedCandidate = normalizeJsonLikeCandidate(candidate);
+  const variants = normalizedCandidate === candidate.trim() ? [candidate.trim()] : [candidate.trim(), normalizedCandidate];
+
+  for (const variant of variants) {
+    try {
+      return JSON.parse(variant) as unknown;
+    } catch {
+      // 继续尝试其他变体
+    }
+  }
+
+  return undefined;
+}
+
+function extractToolNameHints(text: string): string[] {
+  const sanitized = sanitizeToolResponseText(text);
+  const names = new Set<string>();
+  const patterns = [
+    /(?:使用|调用|use|call)\s+([A-Za-z_][\w-]*)\s*(?:工具|函数)?/gi,
+    /(?:工具调用|调用工具|tool calls?|toolcall)\s*[:：]?\s*([A-Za-z_][\w-]*)/gi,
+    /name\s*[:：]\s*([A-Za-z_][\w-]*)/gi,
+    /\b([A-Za-z_][\w-]*)\s*\(/g,
+  ];
+
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(sanitized)) !== null) {
+      const name = normalizeWhitespace(match[1] || '');
+      if (name) names.add(name);
+    }
+  }
+
+  return [...names];
+}
+
 function extractFirstJsonStructure(text: string): string | null {
   let start = -1;
   const stack: string[] = [];
@@ -773,35 +719,29 @@ function extractFirstJsonStructure(text: string): string | null {
 }
 
 function parseToolAdapterPayload(text: string): unknown {
+  const sanitized = sanitizeToolResponseText(text);
   const candidates = [
     text.trim(),
-    text
-      .trim()
-      .replace(/^```(?:json)?/i, '')
-      .replace(/```$/i, '')
-      .trim(),
+    sanitized.trim(),
     extractTaggedToolResponse(text),
-    extractFirstJsonStructure(text),
+    extractFirstJsonStructure(sanitized),
   ].filter((candidate): candidate is string => Boolean(candidate && candidate.trim()));
 
   for (const candidate of candidates) {
-    try {
-      const parsed = JSON.parse(candidate) as unknown;
-      if (parsed && typeof parsed === 'object') return parsed;
-    } catch {
-      // 继续尝试其他候选
-    }
+    const parsed = parseJsonLikeValue(candidate);
+    if (parsed && typeof parsed === 'object') return parsed;
   }
 
   return undefined;
 }
 
 function extractHeuristicToolCalls(text: string): Array<{ name: string; arguments: unknown }> {
+  const sanitized = sanitizeToolResponseText(text);
   const calls: Array<{ name: string; arguments: unknown }> = [];
   const pattern = /Tool call:\s*([A-Za-z_][\w-]*)\s*([^\n]*)/gi;
   let match: RegExpExecArray | null;
 
-  while ((match = pattern.exec(text)) !== null) {
+  while ((match = pattern.exec(sanitized)) !== null) {
     const name = normalizeWhitespace(match[1] || '');
     const rest = normalizeWhitespace(match[2] || '');
     const args: Record<string, string> = {};
@@ -817,7 +757,7 @@ function extractHeuristicToolCalls(text: string): Array<{ name: string; argument
     });
   }
 
-  const chineseMatch = text.match(
+  const chineseMatch = sanitized.match(
     /(工具调用|调用工具)[:：]\s*([A-Za-z_][\w-]*)[\s\S]*?参数[:：]\s*([\s\S]*)/i
   );
   if (chineseMatch) {
@@ -826,12 +766,13 @@ function extractHeuristicToolCalls(text: string): Array<{ name: string; argument
     const jsonCandidate = extractFirstJsonStructure(rawArguments);
     if (name) {
       if (jsonCandidate) {
-        try {
+        const parsedArguments = parseJsonLikeValue(jsonCandidate);
+        if (parsedArguments && typeof parsedArguments === 'object') {
           calls.push({
             name,
-            arguments: JSON.parse(jsonCandidate) as unknown,
+            arguments: parsedArguments,
           });
-        } catch {
+        } else {
           calls.push({ name, arguments: {} });
         }
       } else {
@@ -840,23 +781,24 @@ function extractHeuristicToolCalls(text: string): Array<{ name: string; argument
     }
   }
 
-  const objectStyleMatch = text.match(
+  const objectStyleMatch = sanitized.match(
     /tool_call:\s*\{[\s\S]*?['"]name['"]\s*:\s*['"]([^'"]+)['"][\s\S]*?['"]arguments['"]\s*:\s*['"]([^'"]*)['"][\s\S]*?\}/i
   );
   if (objectStyleMatch) {
     const name = normalizeWhitespace(objectStyleMatch[1] || '');
     const rawArguments = objectStyleMatch[2] || '{}';
-    try {
+    const parsedArguments = parseJsonLikeValue(rawArguments);
+    if (parsedArguments && typeof parsedArguments === 'object') {
       calls.push({
         name,
-        arguments: JSON.parse(rawArguments) as unknown,
+        arguments: parsedArguments,
       });
-    } catch {
+    } else {
       calls.push({ name, arguments: {} });
     }
   }
 
-  const namedStyleMatch = text.match(
+  const namedStyleMatch = sanitized.match(
     /Tool call name:\s*([A-Za-z_][\w-]*)[\s\S]*?Arguments:\s*([\s\S]*)/i
   );
   if (namedStyleMatch) {
@@ -864,12 +806,13 @@ function extractHeuristicToolCalls(text: string): Array<{ name: string; argument
     const jsonCandidate = extractFirstJsonStructure(namedStyleMatch[2] || '');
     if (name) {
       if (jsonCandidate) {
-        try {
+        const parsedArguments = parseJsonLikeValue(jsonCandidate);
+        if (parsedArguments && typeof parsedArguments === 'object') {
           calls.push({
             name,
-            arguments: JSON.parse(jsonCandidate) as unknown,
+            arguments: parsedArguments,
           });
-        } catch {
+        } else {
           calls.push({ name, arguments: {} });
         }
       } else {
@@ -878,7 +821,7 @@ function extractHeuristicToolCalls(text: string): Array<{ name: string; argument
     }
   }
 
-  const listStyleMatch = text.match(
+  const listStyleMatch = sanitized.match(
     /Tool calls?:[\s\S]*?name:\s*([A-Za-z_][\w-]*)[\s\S]*?arguments:\s*([\s\S]*)/i
   );
   if (listStyleMatch) {
@@ -886,12 +829,13 @@ function extractHeuristicToolCalls(text: string): Array<{ name: string; argument
     const jsonCandidate = extractFirstJsonStructure(listStyleMatch[2] || '');
     if (name) {
       if (jsonCandidate) {
-        try {
+        const parsedArguments = parseJsonLikeValue(jsonCandidate);
+        if (parsedArguments && typeof parsedArguments === 'object') {
           calls.push({
             name,
-            arguments: JSON.parse(jsonCandidate) as unknown,
+            arguments: parsedArguments,
           });
-        } catch {
+        } else {
           calls.push({ name, arguments: {} });
         }
       } else {
@@ -900,7 +844,7 @@ function extractHeuristicToolCalls(text: string): Array<{ name: string; argument
     }
   }
 
-  const functionStyleMatch = text.match(/([A-Za-z_][\w-]*)\(([^)]*)\)/);
+  const functionStyleMatch = sanitized.match(/([A-Za-z_][\w-]*)\(([^)]*)\)/);
   if (functionStyleMatch) {
     const name = normalizeWhitespace(functionStyleMatch[1] || '');
     const rawArguments = functionStyleMatch[2] || '';
@@ -918,7 +862,7 @@ function extractHeuristicToolCalls(text: string): Array<{ name: string; argument
     }
   }
 
-  const xmlStyleMatch = text.match(/<([A-Za-z_][\w-]*)>([\s\S]*?)<\/\1>/);
+  const xmlStyleMatch = sanitized.match(/<([A-Za-z_][\w-]*)>([\s\S]*?)<\/\1>/);
   if (xmlStyleMatch) {
     const name = normalizeWhitespace(xmlStyleMatch[1] || '');
     const inner = xmlStyleMatch[2] || '';
@@ -936,17 +880,50 @@ function extractHeuristicToolCalls(text: string): Array<{ name: string; argument
     }
   }
 
+  const hintedToolNames = extractToolNameHints(sanitized);
+  const jsonCandidate = extractFirstJsonStructure(sanitized);
+  if (hintedToolNames.length === 1 && jsonCandidate) {
+    const parsedPayload = parseJsonLikeValue(jsonCandidate);
+    if (Array.isArray(parsedPayload)) {
+      for (const item of parsedPayload) {
+        if (!item || typeof item !== 'object') continue;
+        const record = item as JsonRecord;
+        if (typeof record.name === 'string') {
+          calls.push({
+            name: normalizeWhitespace(record.name),
+            arguments: record.arguments ?? {},
+          });
+          continue;
+        }
+
+        calls.push({
+          name: hintedToolNames[0] || '',
+          arguments: item,
+        });
+      }
+    } else if (parsedPayload && typeof parsedPayload === 'object') {
+      const record = parsedPayload as JsonRecord;
+      if (typeof record.name === 'string') {
+        calls.push({
+          name: normalizeWhitespace(record.name),
+          arguments: record.arguments ?? {},
+        });
+      } else {
+        calls.push({
+          name: hintedToolNames[0] || '',
+          arguments: parsedPayload,
+        });
+      }
+    }
+  }
+
   return calls;
 }
 
 function normalizeToolArguments(argumentsValue: unknown): string {
   if (typeof argumentsValue === 'string') {
-    try {
-      const parsed = JSON.parse(argumentsValue);
-      if (parsed && typeof parsed === 'object') return JSON.stringify(parsed);
-    } catch {
-      // 保留原始字符串
-    }
+    const parsed = parseJsonLikeValue(argumentsValue);
+    if (parsed && typeof parsed === 'object') return JSON.stringify(parsed);
     return argumentsValue.trim() || '{}';
   }
 
@@ -955,6 +932,103 @@ function normalizeToolArguments(argumentsValue: unknown): string {
   }
 
   return '{}';
+}
+
+function canonicalizeIdentifier(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fa5]/g, '');
+}
+
+function normalizeArgumentsForToolSchema(
+  argumentsValue: unknown,
+  tool: NormalizedToolDefinition | undefined
+): string {
+  const normalizedArguments = normalizeToolArguments(argumentsValue);
+  if (!tool) return normalizedArguments;
+
+  const parsedArguments = parseJsonLikeValue(normalizedArguments);
+  if (!parsedArguments || typeof parsedArguments !== 'object' || Array.isArray(parsedArguments)) {
+    return normalizedArguments;
+  }
+
+  const schema =
+    tool.parameters && typeof tool.parameters === 'object' ? (tool.parameters as JsonRecord) : undefined;
+  const properties =
+    schema?.properties && typeof schema.properties === 'object'
+      ? (schema.properties as Record<string, unknown>)
+      : undefined;
+  const schemaKeys = properties ? Object.keys(properties) : [];
+  if (schemaKeys.length === 0) return normalizedArguments;
+
+  const requiredKeys = Array.isArray(schema?.required)
+    ? schema.required.filter((item): item is string => typeof item === 'string')
+    : [];
+  const argumentRecord = parsedArguments as JsonRecord;
+  const normalizedRecord: JsonRecord = {};
+  const usedInputKeys = new Set<string>();
+  const canonicalSchemaKeyMap = new Map<string, string>();
+
+  for (const schemaKey of schemaKeys) {
+    const canonicalKey = canonicalizeIdentifier(schemaKey);
+    if (canonicalKey && !canonicalSchemaKeyMap.has(canonicalKey)) {
+      canonicalSchemaKeyMap.set(canonicalKey, schemaKey);
+    }
+  }
+
+  for (const schemaKey of schemaKeys) {
+    if (Object.hasOwn(argumentRecord, schemaKey)) {
+      normalizedRecord[schemaKey] = argumentRecord[schemaKey];
+      usedInputKeys.add(schemaKey);
+    }
+  }
+
+  for (const [inputKey, inputValue] of Object.entries(argumentRecord)) {
+    if (usedInputKeys.has(inputKey)) continue;
+    const canonicalInputKey = canonicalizeIdentifier(inputKey);
+    const exactCanonicalMatch = canonicalSchemaKeyMap.get(canonicalInputKey);
+    if (exactCanonicalMatch && !Object.hasOwn(normalizedRecord, exactCanonicalMatch)) {
+      normalizedRecord[exactCanonicalMatch] = inputValue;
+      usedInputKeys.add(inputKey);
+      continue;
+    }
+
+    const fuzzySchemaKey = schemaKeys.find((schemaKey) => {
+      if (Object.hasOwn(normalizedRecord, schemaKey)) return false;
+      const canonicalSchemaKey = canonicalizeIdentifier(schemaKey);
+      return (
+        canonicalInputKey === `${canonicalSchemaKey}name` ||
+        canonicalInputKey === `${canonicalSchemaKey}value` ||
+        canonicalInputKey.endsWith(canonicalSchemaKey) ||
+        canonicalSchemaKey.endsWith(canonicalInputKey)
+      );
+    });
+    if (fuzzySchemaKey) {
+      normalizedRecord[fuzzySchemaKey] = inputValue;
+      usedInputKeys.add(inputKey);
+    }
+  }
+
+  const missingRequiredKeys = requiredKeys.filter((key) => !Object.hasOwn(normalizedRecord, key));
+  const remainingEntries = Object.entries(argumentRecord).filter(([inputKey]) => !usedInputKeys.has(inputKey));
+
+  if (schemaKeys.length === 1 && remainingEntries.length > 0) {
+    const soleSchemaKey = schemaKeys[0] || '';
+    if (soleSchemaKey && !Object.hasOwn(normalizedRecord, soleSchemaKey)) {
+      const firstScalarEntry = remainingEntries.find(([, value]) => {
+        return ['string', 'number', 'boolean'].includes(typeof value);
+      });
+      if (firstScalarEntry) {
+        normalizedRecord[soleSchemaKey] = firstScalarEntry[1];
+      }
+    }
+  } else if (missingRequiredKeys.length === 1 && remainingEntries.length === 1) {
+    const requiredKey = missingRequiredKeys[0] || '';
+    if (requiredKey) {
+      normalizedRecord[requiredKey] = remainingEntries[0]?.[1];
+    }
+  }
+
+  if (Object.keys(normalizedRecord).length === 0) return normalizedArguments;
+  return JSON.stringify(normalizedRecord);
 }
 
 function interpretAssistantResponse(
@@ -969,23 +1043,51 @@ function interpretAssistantResponse(
     };
   }
 
-  const payload = parseToolAdapterPayload(parsed.assistantText);
-  const rawToolCalls =
-    Array.isArray(payload)
-      ? payload
-      : payload &&
-          typeof payload === 'object' &&
-          !Array.isArray(payload) &&
-          typeof (payload as JsonRecord).name === 'string'
-        ? [payload]
-      : payload && typeof payload === 'object' && Array.isArray((payload as JsonRecord).tool_calls)
-        ? ((payload as JsonRecord).tool_calls as unknown[])
-        : payload && typeof payload === 'object' && Array.isArray((payload as JsonRecord).calls)
-          ? ((payload as JsonRecord).calls as unknown[])
-          : extractHeuristicToolCalls(parsed.assistantText);
+  const requestedFunctionToolName = getRequestedFunctionToolName(request.tool_choice);
+  const extractionCandidates = [parsed.assistantText];
+  if ((request.tool_choice === 'required' || requestedFunctionToolName) && parsed.reasoningText) {
+    extractionCandidates.push(`${parsed.assistantText}\n\n${parsed.reasoningText}`);
+    extractionCandidates.push(parsed.reasoningText);
+  }
+
+  let payload: unknown;
+  let rawToolCalls: unknown[] = [];
+
+  for (const candidateText of extractionCandidates) {
+    payload = parseToolAdapterPayload(candidateText);
+    const hintedToolNames = extractToolNameHints(candidateText);
+    const candidateCalls =
+      Array.isArray(payload)
+        ? payload
+        : payload &&
+            typeof payload === 'object' &&
+            !Array.isArray(payload) &&
+            typeof (payload as JsonRecord).name === 'string'
+          ? [payload]
+          : payload && typeof payload === 'object' && Array.isArray((payload as JsonRecord).tool_calls)
+            ? ((payload as JsonRecord).tool_calls as unknown[])
+            : payload && typeof payload === 'object' && Array.isArray((payload as JsonRecord).calls)
+              ? ((payload as JsonRecord).calls as unknown[])
+              : payload &&
+                  typeof payload === 'object' &&
+                  !Array.isArray(payload) &&
+                  hintedToolNames.length === 1
+                ? [{ name: hintedToolNames[0], arguments: payload }]
+                : extractHeuristicToolCalls(candidateText);
+
+    if (candidateCalls.length > 0) {
+      rawToolCalls = candidateCalls;
+      break;
+    }
+  }
 
   if (rawToolCalls.length > 0) {
-    const allowedToolNames = new Set(tools.map((tool) => tool.name));
+    const allowedToolNames = new Set(
+      tools
+        .map((tool) => tool.name)
+        .filter((toolName) => (requestedFunctionToolName ? toolName === requestedFunctionToolName : true))
+    );
+    const toolByName = new Map(tools.map((tool) => [tool.name, tool]));
     const allowParallelToolCalls = request.parallel_tool_calls !== false;
     const normalizedToolCalls: NormalizedToolCall[] = [];
     const dedupeMap = new Map<string, NormalizedToolCall>();
@@ -1012,7 +1114,7 @@ function interpretAssistantResponse(
         type: 'function',
         function: {
           name: functionName,
-          arguments: normalizeToolArguments(record.arguments),
+          arguments: normalizeArgumentsForToolSchema(record.arguments, toolByName.get(functionName)),
         },
       } satisfies NormalizedToolCall;
 
@@ -1059,21 +1161,84 @@ function interpretAssistantResponse(
 }
 
 function parseZaiEventStream(text: string): ZaiParsedStream {
-  const parsed = createEmptyParsedStream();
-  const { blocks, rest } = drainSseBlocks(text);
+  const blocks = text.split(/\n\n+/g);
+  const reasoningDeltas: string[] = [];
+  const answerDeltas: string[] = [];
+  const streamEvents: ZaiStreamEvent[] = [];
+  let usage: JsonRecord | undefined;
+  let upstreamModel: string | null = null;
+  let created: number | null = null;
+  let fallbackReasoning = '';
+  let fallbackContent = '';
+  let upstreamError: string | null = null;
 
   for (const block of blocks) {
     const trimmed = block.trim();
     if (!trimmed) continue;
-    applyZaiSseBlock(parsed, trimmed);
+
+    const lines = trimmed
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('data:'));
+
+    for (const line of lines) {
+      const payload = line.slice(5).trim();
+      if (!payload || payload === '[DONE]') continue;
+
+      try {
+        const parsed = JSON.parse(payload) as JsonRecord;
+        if (typeof parsed.model === 'string' && !upstreamModel) upstreamModel = parsed.model;
+        if (typeof parsed.created === 'number' && !created) created = parsed.created;
+
+        if (parsed.data === '[DONE]') continue;
+        if (!parsed.data || typeof parsed.data !== 'object') continue;
+
+        const data = parsed.data as JsonRecord;
+        const error = data.error;
+        if (error && typeof error === 'object') {
+          const errorRecord = error as JsonRecord;
+          upstreamError = String(errorRecord.detail || errorRecord.message || 'Unknown upstream error');
+          continue;
+        }
+
+        if (data.usage && typeof data.usage === 'object') usage = data.usage as JsonRecord;
+
+        const phase = normalizeUpstreamPhase(typeof data.phase === 'string' ? data.phase : '');
+        const deltaContent = typeof data.delta_content === 'string' ? data.delta_content : '';
+        const content = typeof data.content === 'string' ? data.content : '';
+
+        if (phase === 'reasoning' && deltaContent) {
+          reasoningDeltas.push(deltaContent);
+          streamEvents.push({ phase, deltaContent });
+        }
+
+        if (phase === 'answer' && deltaContent) {
+          answerDeltas.push(deltaContent);
+          streamEvents.push({ phase, deltaContent });
+        }
+
+        if (phase === 'reasoning' && content) fallbackReasoning = content;
+        if (phase === 'answer' && content) fallbackContent = content;
+      } catch {
+        // 忽略无法解析的 data 段
+      }
+    }
   }
 
-  const remaining = rest.trim();
-  if (remaining) {
-    applyZaiSseBlock(parsed, remaining);
-  }
+  if (upstreamError) throw new Error(upstreamError);
 
-  return finalizeParsedStream(parsed);
+  const reasoningText = reasoningDeltas.length > 0 ? reasoningDeltas.join('') : fallbackReasoning;
+  const assistantText = answerDeltas.length > 0 ? answerDeltas.join('') : fallbackContent;
+  return {
+    reasoningDeltas: reasoningDeltas.length > 0 ? reasoningDeltas : reasoningText ? [reasoningText] : [],
+    reasoningText,
+    answerDeltas: answerDeltas.length > 0 ? answerDeltas : assistantText ? [assistantText] : [],
+    assistantText,
+    streamEvents,
+    usage,
+    upstreamModel,
+    created,
+  };
 }
 
 function buildModelListPayload(models: ZaiModelDescriptor[]) {
@@ -1129,17 +1294,13 @@ function buildChatCompletionResponse(
       ? {
           role: 'assistant',
           content: null,
-          phase: 'commentary',
-          reasoning_content: parsed.reasoningText || undefined,
-          reasoning: parsed.reasoningText || undefined,
+          ...(parsed.reasoningText ? { reasoning_content: parsed.reasoningText } : {}),
           tool_calls: assistantResponse.toolCalls,
         }
       : {
           role: 'assistant',
           content: assistantResponse.content,
-          phase: 'final_answer',
-          reasoning_content: parsed.reasoningText || undefined,
-          reasoning: parsed.reasoningText || undefined,
+          ...(parsed.reasoningText ? { reasoning_content: parsed.reasoningText } : {}),
         };
 
   return {
@@ -1190,18 +1351,19 @@ function buildReasoningStreamChunk(id: string, created: number, model: string, r
     id,
     created,
     model,
-    {
-      phase: 'commentary',
-      reasoning_content: reasoningDelta,
-      reasoning: reasoningDelta,
-      ...(MIRROR_REASONING_TO_CONTENT ? { content: reasoningDelta } : {}),
-    },
+    { reasoning_content: reasoningDelta },
     null
   );
 }
 
 function buildContentStreamChunk(id: string, created: number, model: string, contentDelta: string) {
-  return buildStreamChunkEnvelope(id, created, model, { phase: 'final_answer', content: contentDelta }, null);
+  return buildStreamChunkEnvelope(
+    id,
+    created,
+    model,
+    { content: contentDelta },
+    null
+  );
 }
 
 function buildToolCallStreamChunks(
@@ -1233,7 +1395,7 @@ function buildToolCallStreamChunks(
   );
 }
 
-function buildFinishStreamChunk(
+function buildStopStreamChunk(
   id: string,
   created: number,
   model: string,
@@ -1253,22 +1415,47 @@ function buildStreamChunks(
   const chunks: unknown[] = [buildRoleStreamChunk(id, created, responseModel)];
 
   if (assistantResponse.mode === 'tool_calls') {
-    for (const delta of parsed.reasoningDeltas) {
-      chunks.push(buildReasoningStreamChunk(id, created, responseModel, delta));
+    let streamedReasoning = false;
+    for (const event of parsed.streamEvents) {
+      if (event.phase !== 'reasoning' || !event.deltaContent) continue;
+      chunks.push(buildReasoningStreamChunk(id, created, responseModel, event.deltaContent));
+      streamedReasoning = true;
+    }
+
+    if (!streamedReasoning && parsed.reasoningText) {
+      chunks.push(buildReasoningStreamChunk(id, created, responseModel, parsed.reasoningText));
     }
 
     chunks.push(...buildToolCallStreamChunks(id, created, responseModel, assistantResponse.toolCalls));
   } else {
-    for (const delta of parsed.reasoningDeltas) {
-      chunks.push(buildReasoningStreamChunk(id, created, responseModel, delta));
+    let streamedReasoning = false;
+    let streamedAnswer = false;
+
+    for (const event of parsed.streamEvents) {
+      if (!event.deltaContent) continue;
+
+      if (event.phase === 'reasoning') {
+        chunks.push(buildReasoningStreamChunk(id, created, responseModel, event.deltaContent));
+        streamedReasoning = true;
+        continue;
+      }
+
+      if (event.phase === 'answer') {
+        chunks.push(buildContentStreamChunk(id, created, responseModel, event.deltaContent));
+        streamedAnswer = true;
+      }
     }
 
-    for (const delta of parsed.answerDeltas) {
-      chunks.push(buildContentStreamChunk(id, created, responseModel, delta));
+    if (!streamedReasoning && parsed.reasoningText) {
+      chunks.push(buildReasoningStreamChunk(id, created, responseModel, parsed.reasoningText));
+    }
+
+    if (!streamedAnswer && assistantResponse.content) {
+      chunks.push(buildContentStreamChunk(id, created, responseModel, assistantResponse.content));
     }
   }
 
-  chunks.push(buildFinishStreamChunk(id, created, responseModel, assistantResponse.mode === 'tool_calls' ? 'tool_calls' : 'stop'));
+  chunks.push(buildStopStreamChunk(id, created, responseModel, assistantResponse.mode === 'tool_calls' ? 'tool_calls' : 'stop'));
 
   return chunks;
 }
@@ -1287,78 +1474,6 @@ async function buildResponseError(response: Response): Promise<Error> {
   } catch {
     return new Error(text || `HTTP ${response.status}`);
   }
-}
-
-async function relayUpstreamSseToOpenAI(params: {
-  res: ServerResponse;
-  upstreamResponse: Response;
-  request: OpenAIChatRequest;
-  allowIncrementalAnswer: boolean;
-  streamId: string;
-  created: number;
-  model: string;
-}): Promise<{ parsed: ZaiParsedStream; streamedReasoningCount: number; streamedAnswerCount: number }> {
-  const { res, upstreamResponse, request, allowIncrementalAnswer, streamId, created, model } = params;
-  const parsed = createEmptyParsedStream();
-  const reader = upstreamResponse.body?.getReader();
-  if (!reader) throw new Error('上游流响应缺少 body');
-
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let streamedReasoningCount = 0;
-  let streamedAnswerCount = 0;
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const drained = drainSseBlocks(buffer);
-    buffer = drained.rest;
-
-    for (const block of drained.blocks) {
-      const trimmed = block.trim();
-      if (!trimmed) continue;
-
-      const events = applyZaiSseBlock(parsed, trimmed);
-      for (const event of events) {
-        if (event.phase === 'thinking' && event.deltaContent) {
-          writeSseLine(res, buildReasoningStreamChunk(streamId, created, model, event.deltaContent));
-          streamedReasoningCount += 1;
-          continue;
-        }
-
-        if (event.phase === 'answer' && event.deltaContent && allowIncrementalAnswer) {
-          writeSseLine(res, buildContentStreamChunk(streamId, created, model, event.deltaContent));
-          streamedAnswerCount += 1;
-        }
-      }
-    }
-  }
-
-  buffer += decoder.decode();
-  const remaining = buffer.trim();
-  if (remaining) {
-    const events = applyZaiSseBlock(parsed, remaining);
-    for (const event of events) {
-      if (event.phase === 'thinking' && event.deltaContent) {
-        writeSseLine(res, buildReasoningStreamChunk(streamId, created, model, event.deltaContent));
-        streamedReasoningCount += 1;
-        continue;
-      }
-
-      if (event.phase === 'answer' && event.deltaContent && allowIncrementalAnswer) {
-        writeSseLine(res, buildContentStreamChunk(streamId, created, model, event.deltaContent));
-        streamedAnswerCount += 1;
-      }
-    }
-  }
-
-  return {
-    parsed: finalizeParsedStream(parsed),
-    streamedReasoningCount,
-    streamedAnswerCount,
-  };
 }
 
 class ZaiHttpBridge {
@@ -1670,26 +1785,6 @@ class ZaiHttpBridge {
     request: OpenAIChatRequest,
     normalizedMessages: ZaiUpstreamMessage[]
   ): Promise<ZaiParsedStream> {
-    const completionInput = this.buildCompletionInput(request, normalizedMessages);
-    const response = await this.openCompletionResponseWithRetry(completionInput);
-    const text = await response.text();
-    return parseZaiEventStream(text);
-  }
-
-  async completeStream(
-    request: OpenAIChatRequest,
-    normalizedMessages: ZaiUpstreamMessage[],
-    signal?: AbortSignal
-  ): Promise<Response> {
-    const completionInput = this.buildCompletionInput(request, normalizedMessages, signal);
-    return this.openCompletionResponseWithRetry(completionInput);
-  }
-
-  private buildCompletionInput(
-    request: OpenAIChatRequest,
-    normalizedMessages: ZaiUpstreamMessage[],
-    signal?: AbortSignal
-  ) {
     const model = normalizeWhitespace(request.model || '') || DEFAULT_MODEL;
     const originalMessages = Array.isArray(request.messages) ? request.messages : [];
     const currentUserPrompt =
@@ -1697,26 +1792,24 @@ class ZaiHttpBridge {
         ? this.extractCurrentUpstreamPrompt(normalizedMessages)
         : this.extractCurrentUserPrompt(originalMessages)) || 'Hello';
 
-    return {
+    return this.completeWithRetry({
       request,
       model,
       normalizedMessages,
       currentUserPrompt,
       retryAuth: true,
       retryVersion: true,
-      signal,
-    };
+    });
   }
 
-  private async openCompletionResponseWithRetry(input: {
+  private async completeWithRetry(input: {
     request: OpenAIChatRequest;
     model: string;
     normalizedMessages: ZaiUpstreamMessage[];
     currentUserPrompt: string;
     retryAuth: boolean;
     retryVersion: boolean;
-    signal?: AbortSignal;
-  }): Promise<Response> {
+  }): Promise<ZaiParsedStream> {
     const auth = await this.ensureAuth();
     const chat = await this.createChat(input.model, input.currentUserPrompt, auth);
     const signatureContext = this.buildSignatureContext(auth);
@@ -1761,22 +1854,24 @@ class ZaiHttpBridge {
           Referer: `${STARTUP_URL}/c/${chat.chatId}`,
         },
         body: JSON.stringify(completionBody),
-        signal: buildAbortSignal(input.signal),
+        signal: buildAbortSignal(),
       }
     );
 
     if (response.status === 401 && input.retryAuth) {
       this.clearAuth();
-      return this.openCompletionResponseWithRetry({ ...input, retryAuth: false });
+      return this.completeWithRetry({ ...input, retryAuth: false });
     }
 
     if (response.status === 426 && input.retryVersion) {
       this.clearFeVersion();
-      return this.openCompletionResponseWithRetry({ ...input, retryVersion: false });
+      return this.completeWithRetry({ ...input, retryVersion: false });
     }
 
     if (!response.ok) throw await buildResponseError(response);
-    return response;
+
+    const text = await response.text();
+    return parseZaiEventStream(text);
   }
 }
 
@@ -1791,7 +1886,6 @@ const server = createServer(async (req, res) => {
       writeJson(res, 200, {
         status: 'ok',
         service: 'zai-openai-compatible',
-        buildVersion: BUILD_VERSION,
         upstream: STARTUP_URL,
         feVersion,
       });
@@ -1854,126 +1948,6 @@ const server = createServer(async (req, res) => {
         return;
       }
 
-      const conversationHasToolResults = hasToolResults(originalMessages);
-      const mayRequireDeferredToolDecision =
-        normalizedTools.length > 0 && toolChoice.mode !== 'none' && !conversationHasToolResults;
-
-      if (body.stream) {
-        const abortController = new AbortController();
-        const abortUpstream = () => abortController.abort();
-        req.once('close', abortUpstream);
-
-        try {
-          const upstreamResponse = await bridge.completeStream(body, normalizedMessages, abortController.signal);
-          const created = Math.floor(Date.now() / 1000);
-          const responseModel = body.model || DEFAULT_MODEL;
-          const streamId = `chatcmpl_${randomUUID().replace(/-/g, '')}`;
-          const allowIncrementalAnswer = !mayRequireDeferredToolDecision;
-
-          res.writeHead(200, {
-            'Content-Type': 'text/event-stream; charset=utf-8',
-            'Cache-Control': 'no-cache, no-store',
-            Connection: 'keep-alive',
-            'X-Accel-Buffering': 'no',
-          });
-          res.socket?.setNoDelay(true);
-          res.flushHeaders();
-          writeSseLine(res, buildRoleStreamChunk(streamId, created, responseModel));
-
-          let parsed: ZaiParsedStream;
-          let streamedReasoningCount = 0;
-          let streamedAnswerCount = 0;
-
-          const relayed = await relayUpstreamSseToOpenAI({
-            res,
-            upstreamResponse,
-            request: body,
-            allowIncrementalAnswer,
-            streamId,
-            created,
-            model: responseModel,
-          });
-
-          parsed = relayed.parsed;
-          streamedReasoningCount = relayed.streamedReasoningCount;
-          streamedAnswerCount = relayed.streamedAnswerCount;
-
-          let assistantResponse = interpretAssistantResponse(body, parsed, normalizedTools);
-
-          if (
-            normalizedTools.length > 0 &&
-            toolChoice.mode !== 'none' &&
-            !conversationHasToolResults &&
-            assistantResponse.mode === 'assistant'
-          ) {
-            const repairMessages = buildToolRepairMessages(originalMessages, normalizedTools, parsed.assistantText);
-            const repairedRequest: OpenAIChatRequest = {
-              ...body,
-              messages: repairMessages,
-              stream: false,
-            };
-            const repairedNormalizedMessages = normalizeMessages(repairMessages, {
-              tools: normalizedTools,
-              toolChoice,
-              allowParallelToolCalls: body.parallel_tool_calls !== false,
-            });
-            const repairedParsed = await bridge.complete(repairedRequest, repairedNormalizedMessages);
-            const repairedAssistantResponse = interpretAssistantResponse(
-              repairedRequest,
-              repairedParsed,
-              normalizedTools
-            );
-            if (repairedAssistantResponse.mode === 'tool_calls') {
-              assistantResponse = repairedAssistantResponse;
-            }
-          }
-
-          if (streamedReasoningCount === 0 && parsed.reasoningText) {
-            writeSseLine(res, buildReasoningStreamChunk(streamId, created, responseModel, parsed.reasoningText));
-          }
-
-          if (assistantResponse.mode === 'tool_calls') {
-            for (const chunk of buildToolCallStreamChunks(streamId, created, responseModel, assistantResponse.toolCalls)) {
-              writeSseLine(res, chunk);
-            }
-          } else if (!allowIncrementalAnswer) {
-            const answerDeltas =
-              parsed.answerDeltas.length > 0 ? parsed.answerDeltas : parsed.assistantText ? [parsed.assistantText] : [];
-            if (streamedAnswerCount === 0) {
-              for (const delta of answerDeltas) {
-                writeSseLine(res, buildContentStreamChunk(streamId, created, responseModel, delta));
-              }
-            }
-          } else if (streamedAnswerCount === 0 && assistantResponse.content) {
-            writeSseLine(res, buildContentStreamChunk(streamId, created, responseModel, assistantResponse.content));
-          }
-
-          writeSseLine(
-            res,
-            buildFinishStreamChunk(streamId, created, responseModel, assistantResponse.mode === 'tool_calls' ? 'tool_calls' : 'stop')
-          );
-          writeSseLine(res, '[DONE]');
-          res.end();
-          return;
-        } catch (error) {
-          if (res.headersSent) {
-            writeSseLine(res, {
-              error: {
-                message: error instanceof Error ? error.message : String(error),
-                type: 'server_error',
-                code: 'stream_error',
-              },
-            });
-            writeSseLine(res, '[DONE]');
-            res.end();
-            return;
-          }
-          throw error;
-        } finally {
-          req.off('close', abortUpstream);
-        }
-      }
-
       let parsed = await bridge.complete(body, normalizedMessages);
       let assistantResponse = interpretAssistantResponse(body, parsed, normalizedTools);
 
@@ -1983,7 +1957,13 @@ const server = createServer(async (req, res) => {
         !hasToolResults(originalMessages) &&
         assistantResponse.mode === 'assistant'
       ) {
-        const repairMessages = buildToolRepairMessages(originalMessages, normalizedTools, parsed.assistantText);
+        const repairMessages = buildToolRepairMessages(
+          originalMessages,
+          normalizedTools,
+          parsed.assistantText,
+          toolChoice,
+          body.parallel_tool_calls !== false
+        );
         const repairedRequest: OpenAIChatRequest = {
           ...body,
           messages: repairMessages,
@@ -2004,6 +1984,20 @@ const server = createServer(async (req, res) => {
           parsed = repairedParsed;
           assistantResponse = repairedAssistantResponse;
         }
+      }
+
+      if (body.stream) {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache, no-store',
+          Connection: 'keep-alive',
+        });
+        for (const chunk of buildStreamChunks(body, parsed, assistantResponse)) {
+          writeSseLine(res, chunk);
+        }
+        writeSseLine(res, '[DONE]');
+        res.end();
+        return;
       }
 
       writeJson(res, 200, buildChatCompletionResponse(body, parsed, assistantResponse));
@@ -2043,6 +2037,5 @@ process.on('SIGTERM', () => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[zai-openai-compatible] listening on http://${HOST}:${PORT}`);
-  console.log(`[zai-openai-compatible] buildVersion=${BUILD_VERSION}`);
   console.log('[zai-openai-compatible] endpoints: GET /health, GET /v1/models, POST /v1/chat/completions');
 });

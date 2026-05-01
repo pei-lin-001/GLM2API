@@ -31,7 +31,6 @@ BIND_HOST="${DEFAULT_HOST}"
 BIND_PORT="${DEFAULT_PORT}"
 HEALTH_HOST="127.0.0.1"
 HEALTH_URL=""
-BUILD_VERSION=""
 
 log() {
   printf '[deploy-zai-linux] %s\n' "$*"
@@ -74,44 +73,6 @@ fetch_url() {
   fail "需要 curl 或 wget 才能下载部署依赖"
 }
 
-health_response_is_expected() {
-  local response_body
-  response_body="$(fetch_url "${HEALTH_URL}" 2>/dev/null || true)"
-  [[ -n "${response_body}" ]] || return 1
-  [[ "${response_body}" == *'"service":"zai-openai-compatible"'* ]] || return 1
-  [[ "${response_body}" == *'"status":"ok"'* ]] || return 1
-}
-
-ensure_port_available() {
-  local output=""
-
-  if command -v lsof >/dev/null 2>&1; then
-    output="$(lsof -iTCP:${BIND_PORT} -sTCP:LISTEN -n -P 2>/dev/null || true)"
-    if [[ -n "${output}" ]]; then
-      fail "端口 ${BIND_PORT} 已被其他进程占用，请更换 ZAI_OPENAI_PORT 或先释放端口"
-    fi
-    return
-  fi
-
-  if command -v ss >/dev/null 2>&1; then
-    output="$(ss -ltn "sport = :${BIND_PORT}" 2>/dev/null | tail -n +2 || true)"
-    if [[ -n "${output//[[:space:]]/}" ]]; then
-      fail "端口 ${BIND_PORT} 已被其他进程占用，请更换 ZAI_OPENAI_PORT 或先释放端口"
-    fi
-    return
-  fi
-
-  if command -v netstat >/dev/null 2>&1; then
-    output="$(netstat -lnt 2>/dev/null | awk -v port=\":${BIND_PORT}\" '$4 ~ port { print $0 }' || true)"
-    if [[ -n "${output}" ]]; then
-      fail "端口 ${BIND_PORT} 已被其他进程占用，请更换 ZAI_OPENAI_PORT 或先释放端口"
-    fi
-    return
-  fi
-
-  log "未找到 lsof/ss/netstat，跳过端口占用预检查"
-}
-
 version_major() {
   local version="$1"
   printf '%s' "$version" | sed -E 's/^v?([0-9]+).*/\1/'
@@ -122,14 +83,6 @@ read_package_manager() {
   if [[ -z "${PNPM_PACKAGE}" ]]; then
     fail '无法从 package.json 读取 packageManager'
   fi
-}
-
-resolve_build_version() {
-  if command -v git >/dev/null 2>&1 && git -C "${ROOT_DIR}" rev-parse --short HEAD >/dev/null 2>&1; then
-    BUILD_VERSION="$(git -C "${ROOT_DIR}" rev-parse --short HEAD)"
-    return
-  fi
-  BUILD_VERSION="unknown"
 }
 
 ensure_dirs() {
@@ -168,7 +121,6 @@ ZAI_MODELS_CACHE_TTL_MS=300000
 ZAI_FE_VERSION_CACHE_TTL_MS=1800000
 ZAI_ENABLE_THINKING=true
 ZAI_PREVIEW_MODE=true
-ZAI_MIRROR_REASONING_TO_CONTENT=false
 ENVEOF
 
   log "已生成默认环境文件：${ENV_FILE}"
@@ -304,7 +256,6 @@ cd "${ROOT_DIR}"
 set -a
 source "${ENV_FILE}"
 set +a
-export ZAI_BUILD_VERSION="${BUILD_VERSION}"
 exec "${NODE_BIN}" "${PNPM_CLI}" exec tsx scripts/zai-openai-compatible.ts
 LAUNCHEOF
   chmod +x "${LAUNCH_FILE}"
@@ -329,7 +280,7 @@ is_running() {
 wait_for_health() {
   local waited=0
   while [[ "${waited}" -lt "${START_TIMEOUT_SECONDS}" ]]; do
-    if health_response_is_expected; then
+    if fetch_url "${HEALTH_URL}" >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -344,7 +295,6 @@ start_service() {
     log "服务已在运行，PID=$(cat "${PID_FILE}")"
     return
   fi
-  ensure_port_available
 
   : >"${LOG_FILE}"
   nohup "${LAUNCH_FILE}" >>"${LOG_FILE}" 2>&1 &
@@ -387,7 +337,7 @@ status_service() {
   if is_running; then
     local pid health='down'
     pid="$(cat "${PID_FILE}")"
-    if health_response_is_expected; then
+    if fetch_url "${HEALTH_URL}" >/dev/null 2>&1; then
       health='up'
     fi
     log "运行中 | PID=${pid} | health=${health} | ${HEALTH_URL}"
@@ -425,7 +375,6 @@ deploy_service() {
   ensure_dirs
   ensure_env_file
   load_env_file
-  resolve_build_version
   read_package_manager
   ensure_node_and_npm
   ensure_pnpm
@@ -444,7 +393,6 @@ main() {
       ensure_dirs
       ensure_env_file
       load_env_file
-      resolve_build_version
       read_package_manager
       ensure_node_and_npm
       ensure_pnpm
@@ -456,7 +404,6 @@ main() {
       ensure_dirs
       ensure_env_file
       load_env_file
-      resolve_build_version
       read_package_manager
       ensure_node_and_npm
       ensure_pnpm
@@ -473,7 +420,6 @@ main() {
       ensure_dirs
       ensure_env_file
       load_env_file
-      resolve_build_version
       read_package_manager
       ensure_node_and_npm
       ensure_pnpm
